@@ -1,0 +1,17 @@
+{
+  "name": "bitrix-partner-request-automation",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "login": "node src/bitrix-partner-requests.mjs login",
+    "dry-run": "node src/bitrix-partner-requests.mjs run --dry-run",
+    "run": "node src/bitrix-partner-requests.mjs run",
+    "daemon": "node src/bitrix-partner-requests.mjs daemon"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "nodemailer": "^6.9.16",
+    "playwright": "^1.49.1"
+  }
+}

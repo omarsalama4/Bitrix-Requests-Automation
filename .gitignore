@@ -1,0 +1,6 @@
+node_modules/
+work/auth/
+work/runs/
+work/pnpm-home/
+work/pnpm-store/
+.env
