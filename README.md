@@ -88,6 +88,8 @@ DEV_EMAIL_TO=devops@example.com,developer@example.com
 
 For Gmail, use a Google App Password, not the normal account password.
 
+`BITRIX_EMAIL` and `BITRIX_PASSWORD` are used for automatic login recovery when the saved browser session expires. They do not bypass MFA, captcha, SSO, or any other manual verification required by Bitrix.
+
 ## First-Time Login
 
 Run once on the server or workstation:
@@ -122,6 +124,27 @@ node src/bitrix-partner-requests.mjs run --live --bulk --headless --no-output-fi
 ```
 
 or the scheduled `daemon` command.
+
+### Automatic Login Recovery
+
+During a normal scheduled run, the script first tries the saved browser session in `work/auth/bitrix-storage-state.json`.
+
+If Bitrix redirects to the login page, the script will:
+
+1. detect the Bitrix24 login form
+2. fill the email from `BITRIX_EMAIL`
+3. click `Continue`
+4. fill the password from `BITRIX_PASSWORD`
+5. submit the login form
+6. save a refreshed `work/auth/bitrix-storage-state.json` if login succeeds
+7. continue to the Partner App request automation
+
+If Bitrix asks for 2FA, captcha, email/SMS confirmation, SSO, or another manual challenge, the script cannot complete that automatically. In that case:
+
+- the run is marked as failed
+- no business email is sent unless requests were already accepted
+- the developer email explains that manual authentication is required
+- DevOps should run `node src/bitrix-partner-requests.mjs login --headed`, complete the challenge, and let the script refresh `work/auth/bitrix-storage-state.json`
 
 Important security notes:
 

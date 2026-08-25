@@ -160,12 +160,19 @@ async function runOnce() {
     runDir,
     networkLogPath,
     outputFilesSaved: config.saveOutputFiles,
+    auth: {
+      loginPageDetected: false,
+      attemptedAutoLogin: false,
+      autoLoginSucceeded: false,
+      storageStateSaved: false,
+      blockedReason: '',
+    },
   };
 
   try {
     log(`Opening ${config.bitrixUrl}`);
     await page.goto(config.bitrixUrl, { waitUntil: 'domcontentloaded', timeout: 90_000 });
-    await fillLoginIfVisible(page);
+    await autoLoginIfNeeded(page, context, summary.auth);
     log('Waiting for page/network to settle...');
     await page.waitForLoadState('networkidle', { timeout: 60_000 }).catch(() => {});
     log('Waiting for Bitrix Partner App frame...');
@@ -373,22 +380,155 @@ async function acceptIndividually(frame, summary) {
   }
 }
 
+async function autoLoginIfNeeded(page, context, result) {
+
+  if (!(await isLoginPage(page))) return result;
+
+  result.loginPageDetected = true;
+  log('Login page detected; saved Bitrix session is missing or expired.');
+
+  if (!config.email || !config.password) {
+    result.blockedReason = 'BITRIX_EMAIL and BITRIX_PASSWORD are required for automatic login recovery.';
+    throw new Error(result.blockedReason);
+  }
+
+  result.attemptedAutoLogin = true;
+  log('Attempting automatic Bitrix login with credentials from .env.');
+  await fillLoginIfVisible(page);
+
+  await page.waitForLoadState('domcontentloaded', { timeout: 30_000 }).catch(() => {});
+  await page.waitForLoadState('networkidle', { timeout: 60_000 }).catch(() => {});
+
+  if (await isManualAuthChallenge(page)) {
+    result.blockedReason = 'Bitrix requires manual verification such as 2FA, captcha, or an email/SMS confirmation code.';
+    throw new Error(result.blockedReason);
+  }
+
+  await page.waitForFunction(() => {
+    const bodyText = document.body?.innerText || '';
+    const hasLoginInput = Boolean(document.querySelector('#login, input[autocomplete="username"], input[name="USER_LOGIN"], input[name="login"]'));
+    return !hasLoginInput && !/Log in to\b/i.test(bodyText);
+  }, { timeout: 30_000 }).catch(() => {});
+
+  if (await isManualAuthChallenge(page)) {
+    result.blockedReason = 'Bitrix requires manual verification such as 2FA, captcha, or an email/SMS confirmation code.';
+    throw new Error(result.blockedReason);
+  }
+
+  if (await isLoginPage(page)) {
+    result.blockedReason = 'Automatic credential login did not complete. Check credentials or run the login command in headed mode.';
+    throw new Error(result.blockedReason);
+  }
+
+  await fs.mkdir(AUTH_DIR, { recursive: true });
+  await context.storageState({ path: AUTH_STATE });
+  result.autoLoginSucceeded = true;
+  result.storageStateSaved = true;
+  log(`Automatic login succeeded; refreshed auth state saved: ${AUTH_STATE}`);
+  return result;
+}
+
 async function fillLoginIfVisible(page) {
-  if (!config.email || !config.password) return;
+  if (!config.email || !config.password) return false;
 
-  const login = page.locator('input[type="email"], input[name="USER_LOGIN"], input[name="login"], input[name="AUTH_FORM"] + input').first();
-  if (await login.count().catch(() => 0)) {
-    await login.fill(config.email).catch(() => {});
-    const next = page.getByRole('button', { name: /next|continue|log in|login/i }).first();
-    if (await next.count().catch(() => 0)) await next.click().catch(() => {});
+  let filled = false;
+  const login = await firstVisibleLocator(page, [
+    '#login',
+    'input[autocomplete="username"]',
+    'input[type="email"]',
+    'input[name="USER_LOGIN"]',
+    'input[name="login"]',
+    'input[name="AUTH_FORM"] + input',
+  ]);
+  if (login) {
+    await login.fill(config.email);
+    filled = true;
+    await clickFirstVisible(page, [
+      'button.b24net-login-enter-form__continue-btn',
+      'button:has-text("Continue")',
+      'button:has-text("Next")',
+      'button:has-text("Log in")',
+      'button:has-text("Login")',
+    ]);
+    await page.waitForLoadState('domcontentloaded', { timeout: 15_000 }).catch(() => {});
+    await page.waitForTimeout(1500);
   }
 
-  const password = page.locator('input[type="password"], input[name="USER_PASSWORD"], input[name="password"]').first();
-  if (await password.count().catch(() => 0)) {
-    await password.fill(config.password).catch(() => {});
-    const submit = page.getByRole('button', { name: /log in|login|sign in|continue/i }).first();
-    if (await submit.count().catch(() => 0)) await submit.click().catch(() => {});
+  const password = await firstVisibleLocator(page, [
+    'input[type="password"]',
+    'input[autocomplete="current-password"]',
+    'input[name="USER_PASSWORD"]',
+    'input[name="password"]',
+  ]);
+  if (password) {
+    await password.fill(config.password);
+    filled = true;
+    await clickFirstVisible(page, [
+      'button.b24net-login-enter-form__continue-btn',
+      'button:has-text("Log in")',
+      'button:has-text("Login")',
+      'button:has-text("Sign in")',
+      'button:has-text("Continue")',
+    ]);
   }
+
+  return filled;
+}
+
+async function isLoginPage(page) {
+  const url = page.url();
+  if (/bitrix24\.net\/oauth\/authorize/i.test(url)) return true;
+  if (/auth_service_id=Bitrix24Net/i.test(url)) return true;
+
+  const loginInput = await firstVisibleLocator(page, [
+    '#login',
+    'input[autocomplete="username"]',
+    'input[type="email"]',
+    'input[name="USER_LOGIN"]',
+    'input[name="login"]',
+  ]);
+  if (loginInput) return true;
+
+  const bodyText = await page.locator('body').innerText({ timeout: 2000 }).catch(() => '');
+  return /Log in to\s+cultiv\.bitrix24\.com/i.test(bodyText) ||
+    /Email or phone/i.test(bodyText);
+}
+
+async function isManualAuthChallenge(page) {
+  const visibleChallengeInput = await firstVisibleLocator(page, [
+    'input[autocomplete="one-time-code"]',
+    'input[name*="OTP" i]',
+    'input[name*="CODE" i]',
+    'input[id*="otp" i]',
+    'input[id*="code" i]',
+    'iframe[src*="recaptcha"]',
+    '.g-recaptcha',
+  ]);
+  if (visibleChallengeInput) return true;
+
+  const bodyText = await page.locator('body').innerText({ timeout: 2000 }).catch(() => '');
+  return /two-factor|2fa|verification code|confirmation code|email\/sms confirmation|enter captcha|captcha verification/i.test(bodyText);
+}
+
+async function firstVisibleLocator(page, selectors) {
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    if (await locator.isVisible({ timeout: 1000 }).catch(() => false)) {
+      return locator;
+    }
+  }
+  return null;
+}
+
+async function clickFirstVisible(page, selectors) {
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    if (await locator.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await locator.click();
+      return true;
+    }
+  }
+  return false;
 }
 
 async function sendReports(summary) {
@@ -555,6 +695,10 @@ function buildDeveloperReportText(summary) {
     `Limit: ${config.limit || 'No limit'}`,
     `Headless: ${config.headless}`,
     `Filter used: Request = Can take; Personal request = Yes`,
+    `Login page detected: ${summary.auth?.loginPageDetected ? 'Yes' : 'No'}`,
+    `Automatic login attempted: ${summary.auth?.attemptedAutoLogin ? 'Yes' : 'No'}`,
+    `Automatic login succeeded: ${summary.auth?.autoLoginSucceeded ? 'Yes' : 'No'}`,
+    summary.auth?.blockedReason ? `Authentication blocked reason: ${summary.auth.blockedReason}` : '',
     '',
     'Execution Summary',
     '-'.repeat(17),
@@ -614,6 +758,10 @@ function buildDeveloperReportHtml(summary) {
             ${metricRow('Limit', config.limit || 'No limit')}
             ${metricRow('Headless', String(config.headless))}
             ${metricRow('Filter', 'Request = Can take; Personal request = Yes')}
+            ${metricRow('Login page detected', summary.auth?.loginPageDetected ? 'Yes' : 'No')}
+            ${metricRow('Automatic login attempted', summary.auth?.attemptedAutoLogin ? 'Yes' : 'No')}
+            ${metricRow('Automatic login succeeded', summary.auth?.autoLoginSucceeded ? 'Yes' : 'No')}
+            ${summary.auth?.blockedReason ? metricRow('Authentication blocked reason', summary.auth.blockedReason) : ''}
           </tbody>
         </table>
 
