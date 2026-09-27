@@ -32,11 +32,12 @@ Result:
 - `.env.example` - environment variable template
 - `package.json` - dependencies and npm scripts
 - `work/auth/bitrix-storage-state.json` - saved browser login session, created by the login command
+- `work/daily-reports/` - small pending report records and delivery state, required even with output files disabled
 - `work/runs/<timestamp>/summary.json` - optional structured report for each execution
 - `work/runs/<timestamp>/network.jsonl` - optional captured relevant network calls
 - `work/runs/<timestamp>/*.png` - optional before/after/error screenshots
 
-`work/auth`, `work/runs`, `node_modules`, and `.env` are intentionally ignored by git.
+`work/auth`, `work/daily-reports`, `work/runs`, `node_modules`, and `.env` are intentionally ignored by git.
 
 ## Prerequisites
 
@@ -197,6 +198,7 @@ Run modes:
 ```powershell
 node src/bitrix-partner-requests.mjs login
 node src/bitrix-partner-requests.mjs run
+node src/bitrix-partner-requests.mjs report
 node src/bitrix-partner-requests.mjs daemon
 ```
 
@@ -209,7 +211,7 @@ Useful flags:
 - `--limit 1` or `--limit=1` - stop after accepting N requests
 - `--headed` or `--headless=false` - show the browser
 - `--headless` or `--headless=true` - hide the browser
-- `--no-output-files` or `--save-output-files=false` - do not write run artifacts to disk
+- `--no-output-files` or `--save-output-files=false` - do not write run artifacts to disk; the small daily report queue remains
 - `--save-output-files` or `--save-output-files=true` - write screenshots, trace, summary JSON, and network logs
 
 Examples:
@@ -243,16 +245,22 @@ or pass:
 node src/bitrix-partner-requests.mjs run --live --bulk --headless --no-output-files
 ```
 
-With output files disabled, the developer email still includes the execution log and status details, but no screenshots, traces, summary JSON, or network logs are saved.
+With output files disabled, no screenshots, traces, summary JSON, or network logs are saved. Pending email data is kept in `work/daily-reports/` until delivery, then removed. The delivery state remains so the same day's emails are not sent again.
 
-## Scheduling Every 5 Hours
+## Scheduling Runs And Reports
 
-Preferred DevOps approach: schedule one short run every 5 hours instead of keeping a long-lived process.
+Schedule `run` every 5 hours and `report` daily at 10:00 AM in the `Africa/Cairo` time zone. `run` never sends email. `report` sends at most one business email and one developer email for the reporting period ending at that 10:00 AM cutoff. If the server misses a report, the next `report` invocation includes pending runs since the last successful send. Run the commands from the same project directory so they share `work/daily-reports/`.
+
+Alternatively, `daemon` starts a run immediately, repeats runs 5 hours after the preceding run completes, and schedules the daily report at 10:00 AM Cairo time. Use either `daemon` or the two OS schedules, not both.
 
 ### Linux Cron
 
+On Cronie, `CRON_TZ=Africa/Cairo` makes the report trigger use Cairo local time. Check your cron implementation's time-zone support and daylight-saving behavior. The run expression below fires at clock hours 00, 05, 10, 15, and 20; use the systemd timer or `daemon` for an elapsed 5-hour interval.
+
 ```cron
 0 */5 * * * cd /opt/bitrix-partner-request-automation && /usr/bin/node src/bitrix-partner-requests.mjs run --live --bulk --headless --no-output-files >> /var/log/bitrix-partner-requests.log 2>&1
+CRON_TZ=Africa/Cairo
+0 10 * * * cd /opt/bitrix-partner-request-automation && /usr/bin/node src/bitrix-partner-requests.mjs report >> /var/log/bitrix-partner-reports.log 2>&1
 ```
 
 ### systemd Timer
@@ -285,6 +293,17 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+Create a separate `oneshot` service with `ExecStart=/usr/bin/node src/bitrix-partner-requests.mjs report` and this timer:
+
+```ini
+[Timer]
+OnCalendar=*-*-* 10:00:00 Africa/Cairo
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
 ### Windows Task Scheduler
 
 Program:
@@ -305,7 +324,7 @@ Start in:
 C:\path\to\bitrix-partner-request-automation
 ```
 
-Trigger: repeat every `5 hours`.
+Trigger: repeat every `5 hours`. Add a second task with the same **Start in** directory, arguments `src\bitrix-partner-requests.mjs report`, and a daily 10:00 AM trigger. The Windows server must use the Cairo time zone for that trigger; otherwise use `daemon`.
 
 ## Email Reports
 
@@ -317,12 +336,12 @@ Recipients: `BUSINESS_EMAIL_TO`
 
 Use commas, semicolons, or new lines to send to multiple recipients.
 
-The business report is sent only when at least one request is accepted. If a 5-hour interval finds no requests, no business email is sent.
+The business report is sent once per day at 10:00 AM Cairo time when `BUSINESS_EMAIL_TO` contains at least one address. It includes all requests accepted since the previous daily report. If none were accepted, it explicitly says zero. If `BUSINESS_EMAIL_TO` is empty, no business email is sent; the old `EMAIL_TO` setting is ignored.
 
 The business report includes only:
 
 - number of requests accepted
-- requests remaining after the run
+- latest known requests remaining
 - accepted request details in a Bitrix-like table:
   - Request ID
   - Description
@@ -338,7 +357,7 @@ Recipients: `DEV_EMAIL_TO`
 
 Use commas, semicolons, or new lines to send to multiple recipients.
 
-The developer report is sent for every execution, including:
+The developer report is sent once per day at 10:00 AM Cairo time and covers every execution in the period, including:
 
 - successful live runs
 - dry runs
@@ -357,7 +376,7 @@ It includes:
 - run directory
 - network log path
 
-If SMTP variables are missing, the automation still runs and writes local reports under `work/runs/<timestamp>/`.
+If SMTP settings are missing, the automation still runs. Pending daily reports stay in `work/daily-reports/` for a later retry. Debug artifacts under `work/runs/<timestamp>/` are written only when `SAVE_OUTPUT_FILES=true`.
 
 ## Troubleshooting
 

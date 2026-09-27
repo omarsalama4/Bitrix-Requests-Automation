@@ -1,5 +1,6 @@
 node_modules/
 work/auth/
+work/daily-reports/
 work/runs/
 work/pnpm-home/
 work/pnpm-store/

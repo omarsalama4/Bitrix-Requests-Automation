@@ -2,6 +2,7 @@ import 'dotenv/config';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { randomUUID } from 'node:crypto';
 import nodemailer from 'nodemailer';
 import { chromium } from 'playwright';
 
@@ -9,6 +10,14 @@ const ROOT = process.cwd();
 const AUTH_DIR = path.join(ROOT, 'work', 'auth');
 const AUTH_STATE = path.join(AUTH_DIR, 'bitrix-storage-state.json');
 const RUNS_DIR = path.join(ROOT, 'work', 'runs');
+const REPORT_DIR = path.join(ROOT, 'work', 'daily-reports');
+const REPORT_STATE = path.join(REPORT_DIR, 'state.json');
+const REPORT_LOCK = path.join(REPORT_DIR, 'send.lock');
+const REPORT_TIME_ZONE = 'Africa/Cairo';
+const cairoFormatter = new Intl.DateTimeFormat('en-GB', {
+  timeZone: REPORT_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+});
 let activeRunLog = null;
 
 const config = {
@@ -48,9 +57,21 @@ async function main() {
   }
 
   if (command === 'daemon') {
-    await runOnce();
+    scheduleDailyReport();
+    await sendDailyReportsIfDue().catch((error) => console.error(`Daily report failed: ${error.message}`));
+    await runOnce().catch((error) => console.error(`Automation run failed: ${error.message}`));
     const ms = config.runEveryHours * 60 * 60 * 1000;
-    setInterval(() => runOnce().catch((error) => console.error(error)), ms);
+    if (!Number.isFinite(ms) || ms <= 0) throw new Error('RUN_EVERY_HOURS must be a positive number.');
+    const scheduleNextRun = () => setTimeout(async () => {
+      await runOnce().catch((error) => console.error(`Automation run failed: ${error.message}`));
+      scheduleNextRun();
+    }, ms);
+    scheduleNextRun();
+    return;
+  }
+
+  if (command === 'report') {
+    await sendDailyReports();
     return;
   }
 
@@ -96,58 +117,16 @@ async function login() {
 async function runOnce() {
   const startedAt = new Date();
   const runDir = config.saveOutputFiles ? path.join(RUNS_DIR, startedAt.toISOString().replace(/[:.]/g, '-')) : null;
-  if (runDir) await fs.mkdir(runDir, { recursive: true });
   const networkLogPath = runDir ? path.join(runDir, 'network.jsonl') : null;
   activeRunLog = [];
-
-  log(`Starting run: dryRun=${config.dryRun}, mode=${config.acceptMode}, limit=${config.limit || 'none'}, headless=${config.headless}, saveOutputFiles=${config.saveOutputFiles}`);
-  log(runDir ? `Run artifacts: ${runDir}` : 'Output file generation is disabled for this run.');
-  const browser = await chromium.launch({ headless: config.headless });
-  const contextOptions = await fileExists(AUTH_STATE) ? { storageState: AUTH_STATE } : {};
-  log(contextOptions.storageState ? `Using saved login state: ${AUTH_STATE}` : 'No saved login state found; login may be required.');
-  const context = await browser.newContext(contextOptions);
-  if (runDir) await context.tracing.start({ screenshots: true, snapshots: true });
-  const page = await context.newPage();
-  const networkEvents = [];
-
-  page.on('request', (request) => {
-    const url = request.url();
-    if (isInterestingUrl(url)) {
-      const event = {
-        type: 'request',
-        method: request.method(),
-        url,
-        postData: redact(request.postData() || ''),
-        time: new Date().toISOString(),
-      };
-      networkEvents.push(event);
-      if (networkLogPath) void appendJsonl(networkLogPath, event);
-    }
-  });
-
-  page.on('response', async (response) => {
-    const url = response.url();
-    if (isInterestingUrl(url)) {
-      const includeBody = url.includes('PARTNER_TAKE_APPLICATION') ||
-        url.includes('action=automatic') ||
-        url.includes('action=synchronizeQualificationData');
-      const event = {
-        type: 'response',
-        status: response.status(),
-        url,
-        bodyPreview: includeBody ? await response.text().then((text) => redact(text).slice(0, 2000)).catch(() => '') : undefined,
-        time: new Date().toISOString(),
-      };
-      networkEvents.push(event);
-      if (networkLogPath) void appendJsonl(networkLogPath, event);
-    }
-  });
 
   const summary = {
     startedAt: startedAt.toISOString(),
     finishedAt: null,
     dryRun: config.dryRun,
     acceptMode: config.acceptMode,
+    limit: config.limit,
+    headless: config.headless,
     filter: {
       request: 'Can take',
       personalRequest: 'Yes',
@@ -169,7 +148,51 @@ async function runOnce() {
     },
   };
 
+  let browser;
+  let context;
+  let page;
   try {
+    if (runDir) await fs.mkdir(runDir, { recursive: true });
+    log(`Starting run: dryRun=${config.dryRun}, mode=${config.acceptMode}, limit=${config.limit || 'none'}, headless=${config.headless}, saveOutputFiles=${config.saveOutputFiles}`);
+    log(runDir ? `Run artifacts: ${runDir}` : 'Output file generation is disabled for this run.');
+    browser = await chromium.launch({ headless: config.headless });
+    const contextOptions = await fileExists(AUTH_STATE) ? { storageState: AUTH_STATE } : {};
+    log(contextOptions.storageState ? `Using saved login state: ${AUTH_STATE}` : 'No saved login state found; login may be required.');
+    context = await browser.newContext(contextOptions);
+    if (runDir) await context.tracing.start({ screenshots: true, snapshots: true });
+    page = await context.newPage();
+
+    page.on('request', (request) => {
+      const url = request.url();
+      if (isInterestingUrl(url)) {
+        const event = {
+          type: 'request',
+          method: request.method(),
+          url,
+          postData: redact(request.postData() || ''),
+          time: new Date().toISOString(),
+        };
+        if (networkLogPath) void appendJsonl(networkLogPath, event);
+      }
+    });
+
+    page.on('response', async (response) => {
+      const url = response.url();
+      if (isInterestingUrl(url)) {
+        const includeBody = url.includes('PARTNER_TAKE_APPLICATION') ||
+          url.includes('action=automatic') ||
+          url.includes('action=synchronizeQualificationData');
+        const event = {
+          type: 'response',
+          status: response.status(),
+          url,
+          bodyPreview: includeBody ? await response.text().then((text) => redact(text).slice(0, 2000)).catch(() => '') : undefined,
+          time: new Date().toISOString(),
+        };
+        if (networkLogPath) void appendJsonl(networkLogPath, event);
+      }
+    });
+
     log(`Opening ${config.bitrixUrl}`);
     await page.goto(config.bitrixUrl, { waitUntil: 'domcontentloaded', timeout: 90_000 });
     await autoLoginIfNeeded(page, context, summary.auth);
@@ -208,16 +231,16 @@ async function runOnce() {
       message: error.message || String(error),
       details: error.stack || String(error),
     });
-    if (runDir) await page.screenshot({ path: path.join(runDir, 'error.png'), fullPage: true }).catch(() => {});
+    if (runDir && page) await page.screenshot({ path: path.join(runDir, 'error.png'), fullPage: true }).catch(() => {});
     return summary;
   } finally {
     summary.finishedAt = new Date().toISOString();
-    if (runDir) {
-      await fs.writeFile(path.join(runDir, 'summary.json'), JSON.stringify(summary, null, 2));
-      await context.tracing.stop({ path: path.join(runDir, 'trace.zip') }).catch(() => {});
+    if (runDir && await fileExists(runDir)) {
+      await fs.writeFile(path.join(runDir, 'summary.json'), JSON.stringify(summary, null, 2)).catch((error) => console.error(`Summary file failed: ${error.message}`));
+      if (context) await context.tracing.stop({ path: path.join(runDir, 'trace.zip') }).catch(() => {});
     }
-    await browser.close();
-    await sendReports(summary);
+    if (browser) await browser.close().catch((error) => console.error(`Browser close failed: ${error.message}`));
+    await queueDailyReport(summary);
     console.log(JSON.stringify(summary, null, 2));
     activeRunLog = null;
   }
@@ -531,15 +554,6 @@ async function clickFirstVisible(page, selectors) {
   return false;
 }
 
-async function sendReports(summary) {
-  await sendBusinessReport(summary).catch((error) => {
-    console.error(`Business email failed: ${error.message}`);
-  });
-  await sendDeveloperReport(summary).catch((error) => {
-    console.error(`Developer email failed: ${error.message}`);
-  });
-}
-
 async function createTransporter() {
   const host = process.env.SMTP_HOST;
   const user = process.env.SMTP_USER;
@@ -551,17 +565,219 @@ async function createTransporter() {
     port: Number(process.env.SMTP_PORT || 465),
     secure: parseBool(process.env.SMTP_SECURE, true),
     auth: { user, pass },
+    connectionTimeout: 30_000,
+    greetingTimeout: 30_000,
+    socketTimeout: 60_000,
   });
 }
 
+async function queueDailyReport(summary) {
+  if (!parseEmailList(process.env.BUSINESS_EMAIL_TO).length &&
+      !parseEmailList(process.env.DEV_EMAIL_TO || process.env.DEVELOPER_EMAIL_TO).length) return;
+
+  await fs.mkdir(REPORT_DIR, { recursive: true });
+  const id = randomUUID();
+  const entry = {
+    queuedAt: new Date().toISOString(),
+    summary: {
+      ...summary,
+      accepted: summary.accepted.map(reportRequest),
+      discovered: summary.discovered?.map(reportRequest),
+      errors: summary.errors.map((error) => ({
+        message: redact(error.message || ''),
+        details: redact(error.details || ''),
+      })),
+      executionLog: summary.executionLog.map(redact),
+    },
+  };
+  const temporary = path.join(REPORT_DIR, `${id}.tmp`);
+  await fs.writeFile(temporary, JSON.stringify(entry));
+  await fs.rename(temporary, path.join(REPORT_DIR, `${id}.json`));
+  console.log(`Queued run for daily reporting: ${summary.finishedAt}`);
+}
+
+function reportRequest(request) {
+  const { id, description, dateCreated, region, partnerOffers, details, type } = request;
+  return { id, description, dateCreated, region, partnerOffers, details, type };
+}
+
+function cairoParts(date) {
+  return Object.fromEntries(cairoFormatter.formatToParts(date)
+    .filter((part) => part.type !== 'literal')
+    .map((part) => [part.type, Number(part.value)]));
+}
+
+function cairoDateKey(date) {
+  const { year, month, day } = cairoParts(date);
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function adjacentDateKey(dateKey, days) {
+  const [year, month, day] = dateKey.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10);
+}
+
+function cairoTenUtc(dateKey) {
+  const [year, month, day] = dateKey.split('-').map(Number);
+  const desired = Date.UTC(year, month - 1, day, 10);
+  let candidate = desired;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const local = cairoParts(new Date(candidate));
+    const apparent = Date.UTC(local.year, local.month - 1, local.day, local.hour, local.minute, local.second);
+    candidate += desired - apparent;
+  }
+  return new Date(candidate);
+}
+
+function latestReportCutoff(now = new Date()) {
+  const today = cairoDateKey(now);
+  const todayTen = cairoTenUtc(today);
+  const dateKey = now >= todayTen ? today : adjacentDateKey(today, -1);
+  return { dateKey, cutoff: cairoTenUtc(dateKey).toISOString() };
+}
+
+function scheduleDailyReport() {
+  const now = new Date();
+  const today = cairoDateKey(now);
+  const nextDate = now < cairoTenUtc(today) ? today : adjacentDateKey(today, 1);
+  const delay = Math.max(1000, cairoTenUtc(nextDate).getTime() - now.getTime());
+  setTimeout(async () => {
+    try {
+      await sendDailyReports();
+    } catch (error) {
+      console.error(`Daily report failed: ${error.message}`);
+    } finally {
+      scheduleDailyReport();
+    }
+  }, delay);
+}
+
+async function sendDailyReportsIfDue() {
+  const now = new Date();
+  if (now < cairoTenUtc(cairoDateKey(now))) return;
+  if (!(await fileExists(REPORT_STATE)) && !(await fs.readdir(REPORT_DIR).catch(() => []))
+    .some((name) => name.endsWith('.json'))) return;
+  const { cutoff } = latestReportCutoff();
+  const state = await readReportState();
+  if (state.businessThrough !== cutoff || state.developerThrough !== cutoff) {
+    await sendDailyReports();
+  }
+}
+
+async function readReportState() {
+  try {
+    return JSON.parse(await fs.readFile(REPORT_STATE, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return {};
+    throw error;
+  }
+}
+
+async function saveReportState(state) {
+  const temporary = path.join(REPORT_DIR, `state-${randomUUID()}.tmp`);
+  await fs.writeFile(temporary, JSON.stringify(state));
+  await fs.rename(temporary, REPORT_STATE);
+}
+
+async function readQueuedReports() {
+  const names = await fs.readdir(REPORT_DIR);
+  const entries = await Promise.all(names.filter((name) => name.endsWith('.json') && name !== 'state.json')
+    .map(async (name) => ({ name, ...JSON.parse(await fs.readFile(path.join(REPORT_DIR, name), 'utf8')) })));
+  return entries.sort((a, b) => a.queuedAt.localeCompare(b.queuedAt));
+}
+
+async function sendDailyReports() {
+  const now = new Date();
+  if (now < cairoTenUtc(cairoDateKey(now))) {
+    console.log('Daily reports are due at 10:00 AM Cairo time.');
+    return;
+  }
+  await fs.mkdir(REPORT_DIR, { recursive: true });
+  let lock;
+  try {
+    lock = await fs.open(REPORT_LOCK, 'wx');
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    const age = Date.now() - (await fs.stat(REPORT_LOCK)).mtimeMs;
+    if (age < 30 * 60 * 1000) {
+      console.log('Another daily report process is active; skipping this invocation.');
+      return;
+    }
+    await fs.unlink(REPORT_LOCK);
+    lock = await fs.open(REPORT_LOCK, 'wx');
+  }
+
+  try {
+    const { dateKey, cutoff } = latestReportCutoff();
+    const state = await readReportState();
+    const entries = await readQueuedReports();
+    const previousCutoff = cairoTenUtc(adjacentDateKey(dateKey, -1)).toISOString();
+    const periodStart = (through) => formatCairoDateTime(through ||
+      (entries[0]?.queuedAt < previousCutoff ? entries[0].queuedAt : previousCutoff));
+    const periodEnd = formatCairoDateTime(cutoff);
+    let failed = false;
+
+    if (!state.businessThrough || state.businessThrough < cutoff) {
+      const runs = entries.filter((entry) => entry.queuedAt > (state.businessThrough || '') && entry.queuedAt <= cutoff)
+        .map((entry) => entry.summary);
+      const accepted = runs.flatMap((run) => run.accepted);
+      const latestWithRemaining = [...runs].reverse().find((run) => run.remainingCount !== undefined);
+      try {
+        await sendBusinessReport({
+          reportDate: dateKey, periodStart: periodStart(state.businessThrough), periodEnd,
+          accepted, acceptedCount: accepted.length, remainingCount: latestWithRemaining?.remainingCount,
+        });
+        state.businessThrough = cutoff;
+        await saveReportState(state);
+        console.log(`Business daily report handled for ${dateKey}: ${accepted.length} accepted.`);
+      } catch (error) {
+        failed = true;
+        console.error(`Business daily report failed: ${error.message}`);
+      }
+    }
+
+    if (!state.developerThrough || state.developerThrough < cutoff) {
+      const runs = entries.filter((entry) => entry.queuedAt > (state.developerThrough || '') && entry.queuedAt <= cutoff)
+        .map((entry) => entry.summary);
+      try {
+        await sendDeveloperReport({
+          reportDate: dateKey, periodStart: periodStart(state.developerThrough), periodEnd, runs,
+        });
+        state.developerThrough = cutoff;
+        await saveReportState(state);
+        console.log(`Developer daily report handled for ${dateKey}: ${runs.length} runs.`);
+      } catch (error) {
+        failed = true;
+        console.error(`Developer daily report failed: ${error.message}`);
+      }
+    }
+
+    const processedThrough = state.businessThrough && state.developerThrough
+      ? [state.businessThrough, state.developerThrough].sort()[0]
+      : null;
+    if (processedThrough) {
+      await Promise.all(entries.filter((entry) => entry.queuedAt <= processedThrough)
+        .map((entry) => fs.unlink(path.join(REPORT_DIR, entry.name))));
+    }
+    if (failed) throw new Error('One or more daily email reports failed; pending run records were kept for retry.');
+  } finally {
+    await lock.close();
+    await fs.unlink(REPORT_LOCK);
+  }
+}
+
+function formatCairoDateTime(value) {
+  return cairoFormatter.format(new Date(value));
+}
+
 async function sendBusinessReport(summary) {
-  const to = parseEmailList(process.env.BUSINESS_EMAIL_TO || process.env.EMAIL_TO);
-  if (to.length === 0 || summary.acceptedCount === 0) return;
+  const to = parseEmailList(process.env.BUSINESS_EMAIL_TO);
+  if (to.length === 0) return;
 
   const transporter = await createTransporter();
-  if (!transporter) return;
+  if (!transporter) throw new Error('SMTP settings are incomplete; business report was not sent.');
 
-  const subject = `[Bitrix24 Partner Requests] ${summary.acceptedCount} request${summary.acceptedCount === 1 ? '' : 's'} accepted`;
+  const subject = `[Bitrix24 Partner Requests] Daily report ${summary.reportDate} - ${summary.acceptedCount} accepted`;
   const text = buildBusinessReportText(summary);
   const html = buildBusinessReportHtml(summary);
 
@@ -574,18 +790,18 @@ async function sendBusinessReport(summary) {
   });
 }
 
-async function sendDeveloperReport(summary) {
+async function sendDeveloperReport(report) {
   const to = parseEmailList(process.env.DEV_EMAIL_TO || process.env.DEVELOPER_EMAIL_TO);
   if (to.length === 0) return;
 
   const transporter = await createTransporter();
-  if (!transporter) return;
+  if (!transporter) throw new Error('SMTP settings are incomplete; developer report was not sent.');
 
-  const failed = summary.errors.length > 0;
-  const subjectStatus = failed ? 'Failed' : summary.dryRun ? 'Dry run complete' : 'Completed';
-  const subject = `[Bitrix24 Partner Automation] ${subjectStatus} - accepted ${summary.acceptedCount}`;
-  const text = buildDeveloperReportText(summary);
-  const html = buildDeveloperReportHtml(summary);
+  const failed = report.runs.some((run) => run.errors.length > 0);
+  const subjectStatus = failed ? 'FAILURE' : report.runs.length ? 'SUCCESS' : 'NO RUNS';
+  const subject = `[Bitrix24 Partner Automation] Daily ${subjectStatus} ${report.reportDate}`;
+  const text = buildDailyDeveloperText(report);
+  const html = buildDailyDeveloperHtml(report);
 
   await transporter.sendMail({
     from: process.env.EMAIL_FROM || process.env.SMTP_USER,
@@ -598,12 +814,13 @@ async function sendDeveloperReport(summary) {
 
 function buildBusinessReportText(summary) {
   return [
-    'Bitrix24 Partner Requests Accepted',
+    'Bitrix24 Partner Requests - Daily Report',
     '',
+    `Reporting period: ${summary.periodStart} to ${summary.periodEnd} (Cairo time)`,
     `Requests accepted: ${summary.acceptedCount}`,
     summary.remainingCount !== undefined ? `Requests remaining: ${summary.remainingCount}` : '',
     '',
-    'Accepted request details:',
+    summary.acceptedCount ? 'Accepted request details:' : 'No partner requests were accepted during this reporting period.',
     ...summary.accepted.flatMap((request, index) => [
       '',
       `${index + 1}. Request ${request.id || '(unknown id)'}`,
@@ -631,12 +848,13 @@ function buildBusinessReportHtml(summary) {
   <body style="font-family: Arial, sans-serif; color: #1f2937; margin: 0; padding: 24px; background: #f8fafc;">
     <div style="max-width: 980px; margin: 0 auto; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden;">
       <div style="padding: 20px 24px; background: #0f766e; color: #ffffff;">
-        <h1 style="font-size: 20px; margin: 0;">Bitrix24 Partner Requests Accepted</h1>
+        <h1 style="font-size: 20px; margin: 0;">Bitrix24 Partner Requests - Daily Report</h1>
       </div>
       <div style="padding: 20px 24px;">
-        <p style="font-size: 16px; margin: 0 0 16px;">${summary.acceptedCount} request${summary.acceptedCount === 1 ? ' was' : 's were'} accepted.</p>
+        <p style="font-size: 14px; margin: 0 0 12px;">${escapeHtml(summary.periodStart)} to ${escapeHtml(summary.periodEnd)} (Cairo time)</p>
+        <p style="font-size: 16px; margin: 0 0 16px;">${summary.acceptedCount ? `${summary.acceptedCount} request${summary.acceptedCount === 1 ? ' was' : 's were'} accepted.` : 'No partner requests were accepted during this reporting period.'}</p>
         ${summary.remainingCount !== undefined ? `<p style="margin: 0 0 20px;">Requests remaining: <strong>${summary.remainingCount}</strong></p>` : ''}
-        <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+        ${summary.acceptedCount ? `<table style="width: 100%; border-collapse: collapse; font-size: 14px;">
           <thead>
             <tr style="background: #f1f5f9;">
               <th style="text-align: left; padding: 10px; border: 1px solid #e5e7eb;">Request ID</th>
@@ -647,8 +865,56 @@ function buildBusinessReportHtml(summary) {
             </tr>
           </thead>
           <tbody>${rows}</tbody>
-        </table>
+        </table>` : ''}
       </div>
+    </div>
+  </body>
+</html>`;
+}
+
+function buildDailyDeveloperText(report) {
+  const failures = report.runs.filter((run) => run.errors.length > 0).length;
+  const accepted = report.runs.reduce((total, run) => total + run.acceptedCount, 0);
+  return [
+    'Bitrix24 Partner Request Automation - Daily Developer Report',
+    `Reporting period: ${report.periodStart} to ${report.periodEnd} (Cairo time)`,
+    `Result: ${failures ? 'FAILURE' : report.runs.length ? 'SUCCESS' : 'NO RUNS'}`,
+    `Executions: ${report.runs.length}`,
+    `Failed executions: ${failures}`,
+    `Requests accepted: ${accepted}`,
+    '',
+    ...(report.runs.length ? report.runs.flatMap((run, index) => [
+      `Execution ${index + 1} of ${report.runs.length}`,
+      '='.repeat(52),
+      buildDeveloperReportText(run),
+      '',
+    ]) : ['No automation executions were recorded during this reporting period.']),
+  ].join('\n');
+}
+
+function buildDailyDeveloperHtml(report) {
+  const failures = report.runs.filter((run) => run.errors.length > 0).length;
+  const accepted = report.runs.reduce((total, run) => total + run.acceptedCount, 0);
+  const status = failures ? 'FAILURE' : report.runs.length ? 'SUCCESS' : 'NO RUNS';
+  const sections = report.runs.map((run, index) => `
+    <section style="margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 18px;">
+      <h2 style="font-size: 16px; margin: 0 0 12px;">Execution ${index + 1} of ${report.runs.length}: ${escapeHtml(run.errors.length ? 'FAILED' : 'SUCCESS')}</h2>
+      <pre style="white-space: pre-wrap; overflow-wrap: anywhere; background: #f8fafc; border: 1px solid #e5e7eb; padding: 14px; font-size: 12px;">${escapeHtml(buildDeveloperReportText(run))}</pre>
+    </section>
+  `).join('');
+  return `<!doctype html>
+<html>
+  <body style="font-family: Arial, sans-serif; color: #111827; margin: 0; padding: 24px; background: #f8fafc;">
+    <div style="max-width: 980px; margin: 0 auto; background: #fff; border: 1px solid #e5e7eb; padding: 24px;">
+      <h1 style="font-size: 20px; margin: 0 0 16px;">Bitrix24 Partner Request Automation - Daily Developer Report</h1>
+      <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+        ${metricRow('Reporting period', `${report.periodStart} to ${report.periodEnd} (Cairo time)`)}
+        ${metricRow('Result', status)}
+        ${metricRow('Executions', report.runs.length)}
+        ${metricRow('Failed executions', failures)}
+        ${metricRow('Requests accepted', accepted)}
+      </table>
+      ${sections || '<p>No automation executions were recorded during this reporting period.</p>'}
     </div>
   </body>
 </html>`;
@@ -692,8 +958,8 @@ function buildDeveloperReportText(summary) {
     `Started at: ${summary.startedAt}`,
     `Finished at: ${summary.finishedAt}`,
     `Mode: ${summary.dryRun ? 'Dry run' : 'Live run'} / ${summary.acceptMode}`,
-    `Limit: ${config.limit || 'No limit'}`,
-    `Headless: ${config.headless}`,
+    `Limit: ${summary.limit || 'No limit'}`,
+    `Headless: ${summary.headless}`,
     `Filter used: Request = Can take; Personal request = Yes`,
     `Login page detected: ${summary.auth?.loginPageDetected ? 'Yes' : 'No'}`,
     `Automatic login attempted: ${summary.auth?.attemptedAutoLogin ? 'Yes' : 'No'}`,
@@ -727,77 +993,6 @@ function buildDeveloperReportText(summary) {
     summary.outputFilesSaved ? `Run directory: ${summary.runDir}` : 'Output files: disabled',
     summary.outputFilesSaved ? `Network log: ${summary.networkLogPath}` : '',
   ].filter(Boolean).join('\n');
-}
-
-function buildDeveloperReportHtml(summary) {
-  const failed = summary.errors.length > 0;
-  const statusColor = failed ? '#b91c1c' : '#15803d';
-  const statusBg = failed ? '#fee2e2' : '#dcfce7';
-  const statusText = failed ? 'FAILED' : 'SUCCESS';
-  const acceptedRows = buildRequestRows(summary.accepted);
-  const discoveredRows = buildRequestRows(summary.discovered || []);
-  const issueRows = summary.errors.length
-    ? summary.errors.map((error) => `<li><strong>${escapeHtml(error.message || String(error))}</strong>${error.details ? `<pre style="white-space: pre-wrap; background: #f8fafc; border: 1px solid #e5e7eb; padding: 10px; border-radius: 6px; overflow-x: auto;">${escapeHtml(error.details)}</pre>` : ''}</li>`).join('')
-    : '<li>None</li>';
-  const logLines = (summary.executionLog || []).map((line) => escapeHtml(line)).join('\n') || 'No log entries recorded';
-
-  return `<!doctype html>
-<html>
-  <body style="font-family: Arial, sans-serif; color: #111827; margin: 0; padding: 24px; background: #f8fafc;">
-    <div style="max-width: 1100px; margin: 0 auto; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden;">
-      <div style="padding: 20px 24px; background: #111827; color: #ffffff;">
-        <h1 style="font-size: 20px; margin: 0;">Bitrix24 Partner Request Automation - Developer Report</h1>
-      </div>
-      <div style="padding: 20px 24px;">
-        <div style="display: inline-block; padding: 6px 12px; border-radius: 999px; background: ${statusBg}; color: ${statusColor}; font-weight: 700; margin-bottom: 16px;">${statusText}</div>
-        <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px;">
-          <tbody>
-            ${metricRow('Started at', summary.startedAt)}
-            ${metricRow('Finished at', summary.finishedAt)}
-            ${metricRow('Mode', `${summary.dryRun ? 'Dry run' : 'Live run'} / ${summary.acceptMode}`)}
-            ${metricRow('Limit', config.limit || 'No limit')}
-            ${metricRow('Headless', String(config.headless))}
-            ${metricRow('Filter', 'Request = Can take; Personal request = Yes')}
-            ${metricRow('Login page detected', summary.auth?.loginPageDetected ? 'Yes' : 'No')}
-            ${metricRow('Automatic login attempted', summary.auth?.attemptedAutoLogin ? 'Yes' : 'No')}
-            ${metricRow('Automatic login succeeded', summary.auth?.autoLoginSucceeded ? 'Yes' : 'No')}
-            ${summary.auth?.blockedReason ? metricRow('Authentication blocked reason', summary.auth.blockedReason) : ''}
-          </tbody>
-        </table>
-
-        <h2 style="font-size: 16px; margin: 24px 0 10px;">Execution Summary</h2>
-        <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px;">
-          <tbody>
-            ${metricRow('Requests found before action', summary.beforeCount)}
-            ${metricRow('Requests accepted', summary.acceptedCount)}
-            ${summary.remainingCount !== undefined ? metricRow('Requests remaining after action', summary.remainingCount) : ''}
-          </tbody>
-        </table>
-
-        <h2 style="font-size: 16px; margin: 24px 0 10px;">Accepted Requests</h2>
-        ${requestTable(acceptedRows)}
-
-        <h2 style="font-size: 16px; margin: 24px 0 10px;">Discovered Requests</h2>
-        ${requestTable(discoveredRows)}
-
-        <h2 style="font-size: 16px; margin: 24px 0 10px;">Issues</h2>
-        <ul style="font-size: 14px; margin-top: 0;">${issueRows}</ul>
-
-        <h2 style="font-size: 16px; margin: 24px 0 10px;">Execution Log</h2>
-        <pre style="white-space: pre-wrap; background: #0f172a; color: #e5e7eb; padding: 14px; border-radius: 6px; overflow-x: auto; font-size: 12px;">${logLines}</pre>
-
-        <h2 style="font-size: 16px; margin: 24px 0 10px;">Artifacts</h2>
-        <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-          <tbody>
-            ${summary.outputFilesSaved
-              ? `${metricRow('Run directory', summary.runDir)}${metricRow('Network log', summary.networkLogPath)}`
-              : metricRow('Output files', 'Disabled for this run')}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </body>
-</html>`;
 }
 
 function isInterestingUrl(url) {
@@ -865,39 +1060,6 @@ function metricRow(label, value) {
       <th style="width: 260px; text-align: left; vertical-align: top; padding: 8px 10px; border: 1px solid #e5e7eb; background: #f8fafc;">${escapeHtml(label)}</th>
       <td style="padding: 8px 10px; border: 1px solid #e5e7eb;">${formatMultilineHtml(value ?? '-')}</td>
     </tr>
-  `;
-}
-
-function buildRequestRows(requests) {
-  return requests.map((request) => `
-    <tr>
-      <td style="vertical-align: top; padding: 10px; border: 1px solid #e5e7eb;">${escapeHtml(request.id || '-')}</td>
-      <td style="vertical-align: top; padding: 10px; border: 1px solid #e5e7eb;">${formatMultilineHtml(request.description || '-')}</td>
-      <td style="vertical-align: top; padding: 10px; border: 1px solid #e5e7eb;">${escapeHtml(request.dateCreated || '-')}</td>
-      <td style="vertical-align: top; padding: 10px; border: 1px solid #e5e7eb;">${escapeHtml(request.region || '-')}</td>
-      <td style="vertical-align: top; padding: 10px; border: 1px solid #e5e7eb;">${escapeHtml(request.partnerOffers || '-')}</td>
-    </tr>
-  `).join('');
-}
-
-function requestTable(rows) {
-  if (!rows) {
-    return '<p style="font-size: 14px; margin: 0 0 16px;">None</p>';
-  }
-
-  return `
-    <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px;">
-      <thead>
-        <tr style="background: #f1f5f9;">
-          <th style="text-align: left; padding: 10px; border: 1px solid #e5e7eb;">Request ID</th>
-          <th style="text-align: left; padding: 10px; border: 1px solid #e5e7eb;">Description</th>
-          <th style="text-align: left; padding: 10px; border: 1px solid #e5e7eb;">Date Created (UTC+3)</th>
-          <th style="text-align: left; padding: 10px; border: 1px solid #e5e7eb;">Region</th>
-          <th style="text-align: left; padding: 10px; border: 1px solid #e5e7eb;">Partner Offers</th>
-        </tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>
   `;
 }
 
