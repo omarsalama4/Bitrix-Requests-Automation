@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
 import { chromium } from 'playwright';
 
@@ -19,6 +20,10 @@ const cairoFormatter = new Intl.DateTimeFormat('en-GB', {
   hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
 });
 let activeRunLog = null;
+const CATEGORIES = [
+  { value: 'B24', name: 'Requests' },
+  { value: 'QUALIFICATION', name: 'New Registration' },
+];
 
 const config = {
   bitrixUrl: process.env.BITRIX_URL || 'https://cultiv.bitrix24.com/marketplace/app/26/',
@@ -128,12 +133,15 @@ async function runOnce() {
     limit: config.limit,
     headless: config.headless,
     filter: {
+      categories: CATEGORIES.map((category) => category.name),
       request: 'Can take',
       personalRequest: 'Yes',
     },
     beforeCount: 0,
     acceptedCount: 0,
     accepted: [],
+    discovered: [],
+    categories: [],
     errors: [],
     executionLog: activeRunLog,
     runDir,
@@ -198,33 +206,38 @@ async function runOnce() {
     await autoLoginIfNeeded(page, context, summary.auth);
     log('Waiting for page/network to settle...');
     await page.waitForLoadState('networkidle', { timeout: 60_000 }).catch(() => {});
+    await autoLoginIfNeeded(page, context, summary.auth);
     log('Waiting for Bitrix Partner App frame...');
-    const appFrame = await waitForPartnerFrame(page);
-    log('Checking required filters...');
-    await ensureCanTakePersonalFilter(appFrame);
-    await waitForGridRefresh(appFrame);
-    if (runDir) await page.screenshot({ path: path.join(runDir, 'before.png'), fullPage: true });
-
-    let requests = await collectRequests(appFrame);
-    summary.beforeCount = requests.length;
-    log(`Found ${requests.length} matching request(s).`);
-
-    if (config.dryRun || requests.length === 0) {
-      summary.discovered = requests;
-      log(config.dryRun ? 'Dry run enabled; no requests accepted.' : 'No requests to accept.');
-      return summary;
+    let completedCategories = 0;
+    let remainingCount = 0;
+    for (const category of CATEGORIES) {
+      const categorySummary = { category: category.name, beforeCount: 0, acceptedCount: 0 };
+      summary.categories.push(categorySummary);
+      try {
+        const appFrame = await waitForPartnerFrame(page);
+        await ensureCanTakePersonalFilter(appFrame, category);
+        await waitForGridRefresh(appFrame);
+        const requests = (await collectRequests(appFrame)).map((request) => ({ ...request, category: category.name }));
+        categorySummary.beforeCount = requests.length;
+        summary.beforeCount += requests.length;
+        summary.discovered.push(...requests);
+        log(`${category.name}: found ${requests.length} matching request(s).`);
+        if (runDir) await page.screenshot({ path: path.join(runDir, `${category.value}-before.png`), fullPage: true });
+        if (!config.dryRun && requests.length && !limitReached(summary)) {
+          await acceptIndividually(appFrame, summary, category);
+        }
+        const refreshedFrame = await waitForPartnerFrame(page);
+        await ensureCanTakePersonalFilter(refreshedFrame, category);
+        categorySummary.remainingCount = (await collectRequests(refreshedFrame)).length;
+        remainingCount += categorySummary.remainingCount;
+        completedCategories += 1;
+      } catch (error) {
+        summary.errors.push({ message: `${category.name}: ${error.message}`, details: error.stack || String(error) });
+      } finally {
+        categorySummary.acceptedCount = summary.accepted.filter((request) => request.category === category.name).length;
+      }
     }
-
-    log(config.acceptMode === 'bulk'
-      ? 'Accepting all matching requests one by one.'
-      : 'Accepting matching requests one by one.');
-    await acceptIndividually(appFrame, summary);
-
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    const refreshedFrame = await waitForPartnerFrame(page);
-    await ensureCanTakePersonalFilter(refreshedFrame);
-    if (runDir) await page.screenshot({ path: path.join(runDir, 'after.png'), fullPage: true });
-    summary.remainingCount = (await collectRequests(refreshedFrame)).length;
+    if (completedCategories === CATEGORIES.length) summary.remainingCount = remainingCount;
     return summary;
   } catch (error) {
     summary.errors.push({
@@ -276,28 +289,28 @@ async function waitForPartnerFrame(page) {
   throw new Error(`Partner app iframe did not load. Frames seen: ${JSON.stringify(diagnostics)}`);
 }
 
-async function ensureCanTakePersonalFilter(frame) {
-  const hasFilter = await hasRequiredFilter(frame);
+async function ensureCanTakePersonalFilter(frame, category = CATEGORIES[0]) {
+  const hasFilter = await hasRequiredFilter(frame, category);
   if (hasFilter) return;
 
-  log('Applying filter through Bitrix filter API.');
-  const appliedViaApi = await frame.evaluate(() => {
+  log(`Applying filters: Category = ${category.name}; Request = Can take; Personal request = Yes.`);
+  const appliedViaApi = await frame.evaluate((partnership) => {
     const list = window.b24ApplicationList;
     const api = list?.gridFilter?.getApi?.();
     if (!api) return false;
     api.setFields({
-      PARTNERSHIP: 'B24',
+      PARTNERSHIP: partnership,
       PERSONAL: 'Y',
       APPLICATION_BUSY: 'FREE',
     });
     api.apply();
     return true;
-  }).catch(() => false);
+  }, category.value).catch(() => false);
 
   if (appliedViaApi) {
     await waitForGridRefresh(frame);
   } else {
-    const showPersonalCanTake = frame.locator('.js-outer-filter[data-value*="PERSONAL"][data-value*="APPLICATION_BUSY"]').filter({ hasText: 'Show' }).first();
+    const showPersonalCanTake = frame.locator(`.js-outer-filter[data-value*="${category.value}"][data-value*="PERSONAL"][data-value*="APPLICATION_BUSY"]`).filter({ hasText: 'Show' }).first();
     if (await showPersonalCanTake.count()) {
       log('Applying filter through the Personal requests Show shortcut.');
       await showPersonalCanTake.click({ force: true });
@@ -305,20 +318,11 @@ async function ensureCanTakePersonalFilter(frame) {
     }
   }
 
-  if (!(await hasRequiredFilter(frame))) {
-    const requests = await collectRequests(frame);
-    if (requests.length > 0) {
-      log('Required chips are not visible, but accept links are present; continuing.');
-      return;
-    }
-    if (appliedViaApi) {
-      log('Filter API completed and no accept links are present; treating this as zero matching requests.');
-      return;
-    }
+  if (!(await hasRequiredFilter(frame, category))) {
     const visibleFilterText = await frame.locator('#b24_partner_application_filter_search_container').evaluate((node) =>
       (node.innerText || '').replace(/\s+/g, ' ').trim()
     ).catch(() => '');
-    throw new Error(`Required filters are not active and no accept links are present. Visible filter text: ${visibleFilterText || '(empty)'}`);
+    throw new Error(`Required filters for ${category.name} could not be verified. Visible filter text: ${visibleFilterText || '(empty)'}`);
   }
 }
 
@@ -327,11 +331,12 @@ async function waitForGridRefresh(frame) {
   await frame.page().waitForTimeout(2500);
 }
 
-async function hasRequiredFilter(frame) {
+async function hasRequiredFilter(frame, category = CATEGORIES[0]) {
   const chips = await frame.locator('.main-ui-filter-search-square').evaluateAll((nodes) =>
     nodes.map((node) => node.getAttribute('title') || node.textContent || '')
   ).catch(() => []);
-  return chips.some((text) => text.includes('Request: Can take')) &&
+  return chips.some((text) => text.trim() === `Category: ${category.name}`) &&
+    chips.some((text) => text.includes('Request: Can take')) &&
     chips.some((text) => text.includes('Personal request: Yes'));
 }
 
@@ -373,33 +378,65 @@ async function collectRequests(frame) {
     .filter(Boolean));
 }
 
-async function acceptIndividually(frame, summary) {
-  for (let round = 1; round <= 20; round += 1) {
+function verifyAcceptResponse(status, payload) {
+  if (status < 200 || status >= 300) throw new Error(`Acceptance failed: HTTP ${status}.`);
+  if (!payload || !Array.isArray(payload.ERRORS) || !payload.DATA || payload.ERRORS.length) {
+    throw new Error('Bitrix did not confirm acceptance with an error-free ERRORS/DATA response.');
+  }
+}
+
+function uniqueAccepted(runs) {
+  const requests = new Map();
+  for (const run of runs) {
+    if (run.dryRun) continue;
+    for (const request of run.accepted || []) {
+      const key = request.id ? `${request.category || ''}:${request.id}` : JSON.stringify(request);
+      if (!requests.has(key)) requests.set(key, request);
+    }
+  }
+  return [...requests.values()];
+}
+
+async function acceptIndividually(frame, summary, category = CATEGORIES[0]) {
+  for (let round = 1; round <= 1000; round += 1) {
     const requests = await collectRequests(frame);
     if (requests.length === 0) break;
     if (limitReached(summary)) break;
 
     for (const request of requests) {
       if (limitReached(summary)) break;
+      if (!request.id || !request.acceptUrl) throw new Error('Request is missing its ID or acceptance URL.');
+      if (summary.accepted.some((item) => item.id === request.id && item.category === category.name)) {
+        throw new Error(`Previously accepted request ${request.id} is still available; stopping to avoid duplicate actions.`);
+      }
       log(`Accepting request ${request.id || '(no id)'}...`);
       const acceptResponsePromise = frame.page().waitForResponse((response) =>
         response.url().includes('PARTNER_TAKE_APPLICATION') &&
-        response.url().includes(`applicationId=${request.id}`),
+        new URL(response.url()).searchParams.get('applicationId') === request.id,
       { timeout: 30_000 }).catch(() => null);
       await frame.evaluate((url) => {
         window.b24ApplicationList.getApplication({ url });
       }, request.acceptUrl);
       const acceptResponse = await acceptResponsePromise;
-      if (acceptResponse) {
-        log(`Accept response for request ${request.id || '(no id)'}: HTTP ${acceptResponse.status()}`);
-      } else {
-        log(`Accept response for request ${request.id || '(no id)'} was not observed before timeout.`);
+      if (!acceptResponse) throw new Error(`Acceptance of request ${request.id} is unconfirmed: response timed out. Not counted.`);
+      const payload = await acceptResponse.json().catch(() => null);
+      verifyAcceptResponse(acceptResponse.status(), payload);
+      const page = frame.page();
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      frame = await waitForPartnerFrame(page);
+      await ensureCanTakePersonalFilter(frame, category);
+      await waitForGridRefresh(frame);
+      if ((await collectRequests(frame)).some((item) => item.id === request.id)) {
+        throw new Error(`Request ${request.id} remains available after acceptance; not counted.`);
       }
-      summary.accepted.push(request);
-      summary.acceptedCount += 1;
-      await frame.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
-      await frame.page().waitForTimeout(1500);
+      summary.accepted.push({ ...request, category: category.name, acceptedAt: new Date().toISOString(), verified: true });
+      summary.acceptedCount = summary.accepted.length;
+      log(`Verified acceptance of request ${request.id} (${category.name}).`);
+      break;
     }
+  }
+  if (!limitReached(summary) && (await collectRequests(frame)).length) {
+    throw new Error(`${category.name}: safety round limit reached with requests still available.`);
   }
 }
 
@@ -442,6 +479,8 @@ async function autoLoginIfNeeded(page, context, result) {
     result.blockedReason = 'Automatic credential login did not complete. Check credentials or run the login command in headed mode.';
     throw new Error(result.blockedReason);
   }
+
+  await page.goto(config.bitrixUrl, { waitUntil: 'domcontentloaded', timeout: 90_000 });
 
   await fs.mkdir(AUTH_DIR, { recursive: true });
   await context.storageState({ path: AUTH_STATE });
@@ -597,8 +636,8 @@ async function queueDailyReport(summary) {
 }
 
 function reportRequest(request) {
-  const { id, description, dateCreated, region, partnerOffers, details, type } = request;
-  return { id, description, dateCreated, region, partnerOffers, details, type };
+  const { id, description, dateCreated, region, partnerOffers, details, type, category, acceptedAt, verified } = request;
+  return { id, description, dateCreated, region, partnerOffers, details, type, category, acceptedAt, verified };
 }
 
 function cairoParts(date) {
@@ -720,7 +759,7 @@ async function sendDailyReports() {
     if (!state.businessThrough || state.businessThrough < cutoff) {
       const runs = entries.filter((entry) => entry.queuedAt > (state.businessThrough || '') && entry.queuedAt <= cutoff)
         .map((entry) => entry.summary);
-      const accepted = runs.flatMap((run) => run.accepted);
+      const accepted = uniqueAccepted(runs);
       const latestWithRemaining = [...runs].reverse().find((run) => run.remainingCount !== undefined);
       try {
         await sendBusinessReport({
@@ -824,6 +863,7 @@ function buildBusinessReportText(summary) {
     ...summary.accepted.flatMap((request, index) => [
       '',
       `${index + 1}. Request ${request.id || '(unknown id)'}`,
+      `Category: ${request.category || '-'}`,
       `Description: ${request.description || '-'}`,
       `Date created: ${request.dateCreated || '-'}`,
       `Region: ${request.region || '-'}`,
@@ -836,6 +876,7 @@ function buildBusinessReportHtml(summary) {
   const rows = summary.accepted.map((request) => `
     <tr>
       <td>${escapeHtml(request.id || '-')}</td>
+      <td>${escapeHtml(request.category || '-')}</td>
       <td>${formatMultilineHtml(request.description || '-')}</td>
       <td>${escapeHtml(request.dateCreated || '-')}</td>
       <td>${escapeHtml(request.region || '-')}</td>
@@ -858,6 +899,7 @@ function buildBusinessReportHtml(summary) {
           <thead>
             <tr style="background: #f1f5f9;">
               <th style="text-align: left; padding: 10px; border: 1px solid #e5e7eb;">Request ID</th>
+              <th style="text-align: left; padding: 10px; border: 1px solid #e5e7eb;">Category</th>
               <th style="text-align: left; padding: 10px; border: 1px solid #e5e7eb;">Description</th>
               <th style="text-align: left; padding: 10px; border: 1px solid #e5e7eb;">Date Created (UTC+3)</th>
               <th style="text-align: left; padding: 10px; border: 1px solid #e5e7eb;">Region</th>
@@ -874,7 +916,7 @@ function buildBusinessReportHtml(summary) {
 
 function buildDailyDeveloperText(report) {
   const failures = report.runs.filter((run) => run.errors.length > 0).length;
-  const accepted = report.runs.reduce((total, run) => total + run.acceptedCount, 0);
+  const accepted = uniqueAccepted(report.runs).length;
   return [
     'Bitrix24 Partner Request Automation - Daily Developer Report',
     `Reporting period: ${report.periodStart} to ${report.periodEnd} (Cairo time)`,
@@ -894,7 +936,7 @@ function buildDailyDeveloperText(report) {
 
 function buildDailyDeveloperHtml(report) {
   const failures = report.runs.filter((run) => run.errors.length > 0).length;
-  const accepted = report.runs.reduce((total, run) => total + run.acceptedCount, 0);
+  const accepted = uniqueAccepted(report.runs).length;
   const status = failures ? 'FAILURE' : report.runs.length ? 'SUCCESS' : 'NO RUNS';
   const sections = report.runs.map((run, index) => `
     <section style="margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 18px;">
@@ -960,7 +1002,8 @@ function buildDeveloperReportText(summary) {
     `Mode: ${summary.dryRun ? 'Dry run' : 'Live run'} / ${summary.acceptMode}`,
     `Limit: ${summary.limit || 'No limit'}`,
     `Headless: ${summary.headless}`,
-    `Filter used: Request = Can take; Personal request = Yes`,
+    `Filter used: Categories = ${(summary.filter?.categories || ['Requests']).join(', ')}; Request = Can take; Personal request = Yes`,
+    ...(summary.categories || []).map((item) => `Category ${item.category}: found ${item.beforeCount}; verified accepted ${item.acceptedCount}; remaining ${item.remainingCount ?? 'Unknown'}`),
     `Login page detected: ${summary.auth?.loginPageDetected ? 'Yes' : 'No'}`,
     `Automatic login attempted: ${summary.auth?.attemptedAutoLogin ? 'Yes' : 'No'}`,
     `Automatic login succeeded: ${summary.auth?.autoLoginSucceeded ? 'Yes' : 'No'}`,
@@ -1117,7 +1160,9 @@ async function waitForEnter() {
   });
 }
 
-main().catch((error) => {
+export { CATEGORIES, hasRequiredFilter, ensureCanTakePersonalFilter, acceptIndividually, verifyAcceptResponse, uniqueAccepted, reportRequest, buildBusinessReportText, buildDailyDeveloperText, buildDailyDeveloperHtml };
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

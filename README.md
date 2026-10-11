@@ -9,11 +9,19 @@ It targets only requests matching these Bitrix filters:
 - `Request: Can take`
 - `Personal request: Yes`
 
+Every execution checks both `Category: Requests` (`B24`) and `Category: New Registration` (`QUALIFICATION`). Both category filters must be verified before processing. A failure in one category is reported, and the other category is still checked. `--limit` is shared across both categories, not applied separately to each.
+
+Accepted counts increase only after Bitrix returns a successful HTTP response with an empty `ERRORS` array and `DATA`, followed by a refreshed, correctly filtered grid where the request is no longer available. Timeouts, rejected responses, and unverified outcomes are reported as errors, not successful acceptances. An unverified outcome may require manual reconciliation; the automation does not claim that it succeeded.
+
+Daily business and developer totals use the same deduplicated accepted-request records (category plus request ID), excluding dry runs. Developer reports include counts for each category. The five-hour execution interval and daily 10:00 AM Cairo email schedule are unchanged; empty business-recipient settings still suppress business emails. Previously queued records are retained for compatibility and cannot be retroactively verified.
+
+Run focused offline regression tests with `node --test test/bitrix-partner-requests.test.mjs`. These tests do not open a browser, accept real requests, or send emails.
+
 The automation uses Playwright so it behaves like a real logged-in user. It also records network traffic for the Partner App so DevOps can later evaluate whether the same action can be moved to a direct HTTP/API implementation.
 
 ## What Was Validated
 
-The visible one-request validation succeeded with:
+The original one-request validation succeeded with:
 
 ```powershell
 node src/bitrix-partner-requests.mjs run --live --individual --limit 1 --headed
@@ -25,6 +33,35 @@ Result:
 - accepted `1` request
 - left `2` remaining
 - no errors
+
+### Both-Category Validation (2026-10-11)
+
+The updated script was validated locally with a dry run. It found `0` matching requests in `Requests` and `3` in `New Registration`, with `0` accepted and `3` remaining. No requests were accepted and no emails were sent during this check. These numbers are a point-in-time result, not expected fixed production totals.
+
+All `11` offline regression tests passed. They cover category verification, successful acceptance, HTTP errors, application errors, timeouts, unrecognized responses, requests still available after refresh, daily deduplication, and preservation of confirmed acceptances when a later category fails. Live acceptance with the new verification logic has not yet been exercised against Bitrix; the response envelope was checked against previously saved successful responses.
+
+### Reliability Fixes
+
+- The previous filter hardcoded `B24` and missed `New Registration` requests. Each run now checks both categories explicitly.
+- HTTP 200 or a timed-out response no longer increases the accepted count by itself. Only verified acceptances are added to the daily report queue.
+- Missing or incorrect filter chips are failures, not assumed empty queues.
+- Login recovery checks again after navigation settles to catch delayed redirects, returns to the Partner App after successful login, and refreshes the saved authentication state.
+- Business and developer daily totals deduplicate accepted records by category and request ID. Category-level errors remain visible to developers even when another category succeeds.
+
+### Deploying This Update
+
+Updating or pushing this repository does not update an already-running server or Docker container. Use the existing deployment process to pull the changes, rebuild the image if applicable, and restart the existing worker. Keep only one production worker running; do not start a separate daemon beside an existing container or service.
+
+Before resuming live processing, run the tests and a dry run in the deployed runtime:
+
+```sh
+node --test test/bitrix-partner-requests.test.mjs
+node src/bitrix-partner-requests.mjs run --dry-run --no-output-files
+```
+
+Verify that the execution log checks both `Requests` and `New Registration`, and compare the counts with the same account and filters in Bitrix. A normal dry run accepts nothing and sends no immediate email, but it queues a developer-report record for the next daily report when recipients are configured. Preserve `.env`, `work/auth/`, and `work/daily-reports/` across deployment; do not delete pending report records or delivery state.
+
+The production daemon still runs every five hours after each run finishes and reports daily at 10:00 AM `Africa/Cairo`. Live commands and schedules use the deployed `DRY_RUN` setting; keep it `true` during validation and restore the intended production value afterward.
 
 ## Files
 
