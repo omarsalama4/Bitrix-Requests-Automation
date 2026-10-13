@@ -269,6 +269,7 @@ async function waitForPartnerFrame(page) {
         '.partner-application-b24-list-block',
         '.js-grid-cnr',
         '.js-partner-submit-application',
+        'select[name="implementation-request-filter-APPLICATION_BUSY"]',
         '.js-action-button[data-name="automatic_action"]',
       ].join(', ')).count().catch(() => 0);
       if (hasPartnerBlock > 0) {
@@ -294,6 +295,13 @@ async function ensureCanTakePersonalFilter(frame, category = CATEGORIES[0]) {
   if (hasFilter) return;
 
   log(`Applying filters: Category = ${category.name}; Request = Can take; Personal request = Yes.`);
+  if (await frame.locator('select[name="implementation-request-filter-APPLICATION_BUSY"]').count()) {
+    await applyModernFilters(frame, category);
+    if (!(await hasRequiredFilter(frame, category))) {
+      throw new Error(`Updated UI filters for ${category.name} could not be verified; no requests will be accepted.`);
+    }
+    return;
+  }
   const appliedViaApi = await frame.evaluate((partnership) => {
     const list = window.b24ApplicationList;
     const api = list?.gridFilter?.getApi?.();
@@ -311,9 +319,9 @@ async function ensureCanTakePersonalFilter(frame, category = CATEGORIES[0]) {
     await waitForGridRefresh(frame);
   } else {
     const showPersonalCanTake = frame.locator(`.js-outer-filter[data-value*="${category.value}"][data-value*="PERSONAL"][data-value*="APPLICATION_BUSY"]`).filter({ hasText: 'Show' }).first();
-    if (await showPersonalCanTake.count()) {
+    if (await showPersonalCanTake.isVisible().catch(() => false)) {
       log('Applying filter through the Personal requests Show shortcut.');
-      await showPersonalCanTake.click({ force: true });
+      await showPersonalCanTake.click();
       await waitForGridRefresh(frame);
     }
   }
@@ -326,12 +334,47 @@ async function ensureCanTakePersonalFilter(frame, category = CATEGORIES[0]) {
   }
 }
 
+async function applyModernFilters(frame, category) {
+  log(`Using updated Partner App filter controls for ${category.name}.`);
+  const reset = frame.locator('.partner-implementation-request-list__filter-reset');
+  if (await reset.isVisible()) {
+    await reset.click();
+    await waitForGridRefresh(frame);
+  }
+  const categoryButton = frame.locator(`.js-outer-filter[data-indicator="${category.value}"]`);
+  await categoryButton.click();
+  await waitForGridRefresh(frame);
+  await frame.locator('select[name="implementation-request-filter-APPLICATION_BUSY"]').selectOption('FREE');
+  await waitForGridRefresh(frame);
+  const personal = frame.locator('[data-filter-code="PERSONAL"] input[type="checkbox"]');
+  if (!(await personal.isChecked())) {
+    await frame.locator('.partner-implementation-request-list__filter-more-button').click();
+    // The native checkbox is visually replaced by a styled label in the new UI.
+    await frame.locator('[data-filter-code="PERSONAL"] label').click();
+    await waitForGridRefresh(frame);
+  }
+  if (!(await personal.isChecked())) throw new Error('Personal request checkbox did not become checked.');
+}
+
+function readModernFilterState() {
+  const selectedCategory = document.querySelector('.js-outer-filter[data-indicator].partner-application-b24-statistic-table-head-btn-selected');
+  return {
+    category: selectedCategory?.getAttribute('data-indicator'),
+    request: document.querySelector('select[name="implementation-request-filter-APPLICATION_BUSY"]')?.value,
+    personal: document.querySelector('[data-filter-code="PERSONAL"] input[type="checkbox"]')?.checked === true,
+  };
+}
+
 async function waitForGridRefresh(frame) {
   await frame.waitForLoadState('networkidle', { timeout: 45_000 }).catch(() => {});
   await frame.page().waitForTimeout(2500);
 }
 
 async function hasRequiredFilter(frame, category = CATEGORIES[0]) {
+  if (await frame.locator('select[name="implementation-request-filter-APPLICATION_BUSY"]').count()) {
+    const state = await frame.evaluate(readModernFilterState);
+    return state.category === category.value && state.request === 'FREE' && state.personal;
+  }
   const chips = await frame.locator('.main-ui-filter-search-square').evaluateAll((nodes) =>
     nodes.map((node) => node.getAttribute('title') || node.textContent || '')
   ).catch(() => []);
@@ -341,7 +384,7 @@ async function hasRequiredFilter(frame, category = CATEGORIES[0]) {
 }
 
 async function collectRequests(frame) {
-  return frame.locator('tr.main-grid-row-body:not([hidden])').evaluateAll((rows) => rows
+  return frame.locator('tr.main-grid-row-body:not([hidden]), .grid-1__row-outer:not([hidden])').evaluateAll((rows) => rows
     .map((row) => {
       const cleanText = (value) => String(value || '')
         .replace(/\r/g, '')
@@ -361,11 +404,11 @@ async function collectRequests(frame) {
       const accept = row.querySelector('.js-partner-submit-application');
       if (!accept) return null;
       const cellText = (columnId) => {
-        const cell = row.querySelector(`[data-column-id="${columnId}"]`);
+        const cell = row.querySelector(`[data-column-id="${columnId}"], .grid-1__cell-outer[data-id="${columnId}"]`);
         return cleanText(cell?.innerText || cell?.textContent || '');
       };
       return {
-        id: row.getAttribute('data-id') || '',
+        id: row.getAttribute('data-id') || cellText('ID') || new URL(accept.getAttribute('data-url') || '', 'https://util.bitrixsoft.com').searchParams.get('applicationId') || '',
         description: cleanDescription(cellText('DESCRIPTION')),
         dateCreated: cellText('DATE_ACTIVE'),
         region: cellText('CITY'),
@@ -1160,7 +1203,7 @@ async function waitForEnter() {
   });
 }
 
-export { CATEGORIES, hasRequiredFilter, ensureCanTakePersonalFilter, acceptIndividually, verifyAcceptResponse, uniqueAccepted, reportRequest, buildBusinessReportText, buildDailyDeveloperText, buildDailyDeveloperHtml };
+export { CATEGORIES, hasRequiredFilter, ensureCanTakePersonalFilter, applyModernFilters, readModernFilterState, collectRequests, acceptIndividually, verifyAcceptResponse, uniqueAccepted, reportRequest, buildBusinessReportText, buildDailyDeveloperText, buildDailyDeveloperHtml, autoLoginIfNeeded };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch((error) => {
   console.error(error);

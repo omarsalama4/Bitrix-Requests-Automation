@@ -4,6 +4,7 @@ import {
   CATEGORIES, hasRequiredFilter, ensureCanTakePersonalFilter, acceptIndividually,
   verifyAcceptResponse, uniqueAccepted, reportRequest,
   buildBusinessReportText, buildDailyDeveloperText, buildDailyDeveloperHtml,
+  collectRequests, readModernFilterState, applyModernFilters,
 } from '../src/bitrix-partner-requests.mjs';
 
 function fakeFrame({ category = CATEGORIES[0], status = 200, payload = { ERRORS: [], DATA: {} }, timeout = false, remains = false } = {}) {
@@ -15,7 +16,7 @@ function fakeFrame({ category = CATEGORIES[0], status = 200, payload = { ERRORS:
     waitForLoadState: async () => {},
     evaluate: async () => { if (!remains) available = false; },
     locator: (selector) => ({
-      count: async () => 1,
+      count: async () => selector === 'select[name="implementation-request-filter-APPLICATION_BUSY"]' ? 0 : 1,
       evaluate: async () => '',
       evaluateAll: async () => selector.includes('main-ui-filter-search-square')
         ? [`Category: ${category.name}`, 'Request: Can take', 'Personal request: Yes']
@@ -46,7 +47,7 @@ test('both categories are explicitly supported and checked independently', async
 
 test('unverified filters fail instead of becoming an empty success', async () => {
   const frame = fakeFrame();
-  frame.locator = () => ({ evaluateAll: async () => [], evaluate: async () => '' });
+  frame.locator = () => ({ count: async () => 0, evaluateAll: async () => [], evaluate: async () => '' });
   frame.evaluate = async () => true;
   await assert.rejects(ensureCanTakePersonalFilter(frame), /could not be verified/);
 });
@@ -106,4 +107,87 @@ test('a later category failure preserves already verified acceptances in the dai
   const accepted = uniqueAccepted([summary]);
   assert.equal(accepted.length, 1);
   assert.match(buildBusinessReportText({ accepted, acceptedCount: accepted.length }), /Requests accepted: 1/);
+});
+
+test('updated UI applies visible category, Can take and More filters personal checkbox', async () => {
+  const actions = [];
+  const state = { category: 'B24', request: '', personal: false };
+  const frame = {
+    page: () => ({ waitForTimeout: async () => {} }),
+    waitForLoadState: async () => {},
+    evaluate: async () => state,
+    locator: selector => ({
+      count: async () => 1,
+      isVisible: async () => true,
+      isChecked: async () => state.personal,
+      selectOption: async value => { state.request = value; actions.push('can-take'); },
+      click: async () => {
+        if (selector.includes('filter-reset')) { state.request = ''; state.personal = false; actions.push('reset'); }
+        else if (selector.includes('data-indicator')) { state.category = 'QUALIFICATION'; actions.push('category'); }
+        else if (selector.includes('filter-more-button')) actions.push('more-filters');
+        else if (selector.includes('label')) { state.personal = true; actions.push('personal'); }
+        else throw new Error(`Unexpected selector: ${selector}`);
+      },
+    }),
+  };
+  await ensureCanTakePersonalFilter(frame, CATEGORIES[1]);
+  assert.deepEqual(actions, ['reset', 'category', 'can-take', 'more-filters', 'personal']);
+  assert.equal(await hasRequiredFilter(frame, CATEGORIES[1]), true);
+  assert.equal(await hasRequiredFilter(frame, CATEGORIES[0]), false);
+  state.personal = false;
+  assert.equal(await hasRequiredFilter(frame, CATEGORIES[1]), false);
+});
+
+test('modern filter reader checks selected category and actual checkbox state, not obsolete chips', () => {
+  const previous = globalThis.document;
+  globalThis.document = { querySelector: selector => {
+    if (selector.includes('data-indicator')) return { getAttribute: () => 'QUALIFICATION' };
+    if (selector.includes('APPLICATION_BUSY')) return { value: 'FREE' };
+    if (selector.includes('PERSONAL')) return { checked: true };
+    return null;
+  } };
+  try { assert.deepEqual(readModernFilterState(), { category: 'QUALIFICATION', request: 'FREE', personal: true }); }
+  finally { globalThis.document = previous; }
+});
+
+test('collector reads div-based Grid1 rows and column IDs as well as legacy table rows', async () => {
+  for (const modern of [true, false]) {
+    const cells = { ID: '3549375', DESCRIPTION: 'Egypt\nRequest from new client\nMore...', DATE_ACTIVE: 'yesterday, 13:37', CITY: '', OFFER_COUNT: 'Personal request', DETAIL: 'Accept Request\nCancel', IMPLEMENTATION: '' };
+    const row = {
+      getAttribute: () => modern ? null : '3549375',
+      querySelector: selector => {
+        if (selector === '.js-partner-submit-application') return { getAttribute: () => '/?action=PARTNER_TAKE_APPLICATION&applicationId=3549375' };
+        const column = Object.keys(cells).find(key => selector.includes(`="${key}"`));
+        assert.ok(modern ? selector.includes('.grid-1__cell-outer') : selector.includes('data-column-id'));
+        return column ? { innerText: cells[column] } : null;
+      },
+    };
+    const requests = await collectRequests({ locator: selector => {
+      assert.ok(selector.includes('.grid-1__row-outer'));
+      return { evaluateAll: async callback => callback([row]) };
+    } });
+    assert.equal(requests[0].id, '3549375');
+    assert.equal(requests[0].description, 'Egypt\nRequest from new client');
+    assert.equal(requests[0].dateCreated, 'yesterday, 13:37');
+    assert.equal(requests[0].partnerOffers, 'Personal request');
+    assert.equal(requests[0].details, '');
+  }
+});
+
+test('legacy fallback never clicks the hidden personal Show shortcut', async () => {
+  let clicked = false;
+  const locator = {
+    count: async () => 0,
+    evaluateAll: async () => [],
+    evaluate: async () => '',
+    filter: () => locator,
+    first: () => locator,
+    isVisible: async () => false,
+    click: async () => { clicked = true; },
+  };
+  await assert.rejects(ensureCanTakePersonalFilter({
+    locator: () => locator,
+    evaluate: async () => false,
+  }), /could not be verified/);
+  assert.equal(clicked, false);
 });
