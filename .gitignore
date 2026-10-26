@@ -2,6 +2,8 @@ node_modules/
 work/auth/
 work/daily-reports/
 work/runs/
+work/actions/
+work/execution.lock/
 work/pnpm-home/
 work/pnpm-store/
 .env

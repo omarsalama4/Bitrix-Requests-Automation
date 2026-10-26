@@ -17,7 +17,7 @@ Accepted counts increase only after Bitrix returns a successful HTTP response wi
 
 Daily business and developer totals use the same deduplicated accepted-request records (category plus request ID), excluding dry runs. Developer reports include counts for each category. The five-hour execution interval and daily 10:00 AM Cairo email schedule are unchanged; empty business-recipient settings still suppress business emails. Previously queued records are retained for compatibility and cannot be retroactively verified.
 
-Run focused offline regression tests with `node --test test/bitrix-partner-requests.test.mjs`. These tests do not open a browser, accept real requests, or send emails.
+Run all offline regression tests with `npm test` or `node --test test/bitrix-partner-requests.test.mjs test/execution-state.test.mjs`. These tests use temporary local journals/locks; they do not open a browser, accept real requests, or send emails.
 
 The automation uses Playwright so it behaves like a real logged-in user. It also records network traffic for the Partner App so DevOps can later evaluate whether the same action can be moved to a direct HTTP/API implementation.
 
@@ -68,33 +68,80 @@ It found `0` matching requests in `Requests` and `7` in `New Registration`. It a
 
 The local daily-report queue was checked and contained `acceptedCount: 3`, all three IDs marked `verified: true`, and `remainingCount: 4`. No immediate email was sent. This verifies local queue creation, not delivery of the next daily email. The server has a separate report queue; these local results are not automatically copied to it. Output-file suppression does not disable the required daily-report queue.
 
-### Deploying This Update
+### Grid Synchronization Fix (2026-10-26)
+
+An investigation reproduced a stale empty grid for eligible personal request `3552391`: the correct controls were selected and Bitrix received the right filters, but the request appeared only after the asynchronous grid refresh completed. Page-level `networkidle` and a fixed delay did not reliably wait for that refresh.
+
+For the updated UI, each filter action now waits for a successful `Grid.getData` response from the same iframe with the exact expected filter set and page number. The rendered grid must match the response's structured row IDs, order, acceptance-button availability, and supplied date/region/partner-offer/type/country fields, with the loading state finished. An arbitrary mutation or quiet interval is not sufficient. Filter actions are serialized, preventing overlapping reset/category/request/personal updates. A newly loaded iframe must complete this synchronization even if its controls already show the expected values. Discovery, post-acceptance verification, and remaining counts use the reconciled grid. A missing response, HTTP/application error, missing row/pagination metadata, or rendering mismatch is reported as an error with unknown results, not a successful zero count.
+
+Offline tests cover delayed responses and rendering, wrong-category/wrong-frame responses, extra or missing filters, and refresh failures. No live acceptance is required to validate this synchronization change. Existing five-hour execution and daily 10:00 AM Cairo reporting schedules are unchanged.
+
+Local headless dry-run validation found `1` matching request in `Requests` (including previously missed `3552391`) and `10` in `New Registration`, for `11` total, with `0` accepted and `11` remaining. The personal filter response for `Requests` took approximately ten seconds; the new code waited for it and its grid update. No emails were sent during validation. These are point-in-time counts; deploying the update is still required for the server to use the fix.
+
+### Complete Queue Counts and Pagination
+
+Discovery now follows the response's `gridNavigation.hasMore` flag and clicks the grid's `Load more` control until the server reports no more pages. Every appended page must have the expected filters and consecutive page number, and the cumulative rendered rows must match all response rows. Only after the full scan are eligible request IDs reconciled and counted. This applies to dry runs, initial discovery, post-acceptance verification, and remaining counts after a limited live run. `--limit` restricts acceptance, not discovery or reporting of the remaining queue.
+
+Missing pagination controls, duplicate IDs across pages (for example, a shifting queue), response/DOM differences, or the pagination safety limit produce an error instead of a partial total. Counts describe the completed scan, not an atomic snapshot against simultaneous changes by other users. On the legacy table layout, an additional-page control produces an explicit unsupported-pagination error rather than reporting a first-page count as complete.
+
+All `27` offline regression tests pass, including a 51-request/two-page scan, stale IDs/fields/buttons, incorrect page responses, duplicate pages, missing Load more controls, and incomplete collection. An isolated real-browser fixture also verified delayed rendering and loading all 51 fake requests across two pages. The live filtered queue fit on one page per category, so live multi-page behavior has not been exercised against Bitrix.
+
+### Durable Acceptance Records and Recovery
+
+Every live acceptance now uses a persistent journal in `work/actions/`, independent of optional debug output. The script writes an `intent` before submitting the action, persists an `acknowledged` status after Bitrix's successful response, and saves `verified` status immediately after verification, before updating in-memory counts. Writes use temporary files, file synchronization, atomic rename, and directory synchronization where supported. Records contain request details, category/ID, attempt/run IDs, timestamps, and verification status, never acceptance URLs or authentication tokens. If persistence fails before submission, no acceptance is attempted. Corrupt state fails closed.
+
+Each live run first reconciles unfinished actions using the same category, `Personal request`, `Accepted Requests: All`, and exact request ID. Recovery requires a matching own-accepted row with a deal/synchronization/recovery marker and no Accept button. Mere disappearance from the available queue is not recovery evidence. A read-only check confirmed this lookup against previously accepted request `3553571`. Dry runs do not perform acceptance recovery. If evidence is unavailable, the action remains unconfirmed, is excluded from business accepted totals, is highlighted in daily developer reports, and cannot be automatically submitted again. Other requests can still be processed. Review these cases in Bitrix/CRM; do not delete journal records to force retries.
+
+Daily reports combine legacy queued summaries with unreported verified journal entries, deduplicating by category and ID. Thus an acceptance can still be reported when a process crashed before producing its run summary. Business and developer delivery checkpoints are tracked independently. Late verification is included in a subsequent report even if the original execution's cutoff has passed. A disabled recipient group is marked handled without sending, matching existing behavior. Journal records are retained as durable retry/deduplication evidence; preserve them and restrict filesystem access because they include business request details. Retention/compaction is not automatic.
+
+There is no atomic transaction between Bitrix and the local filesystem: a crash after remote acceptance but before local acknowledgement leaves an intent that must be reconciled. Likewise, SMTP delivery followed by a crash before its checkpoint may cause an email retry. These protections provide recovery and prevent blind acceptance retries, not an exactly-once guarantee. Previously accepted actions without journal records cannot be retroactively recovered automatically.
+
+### Shared Execution Lock
+
+`run`, `login`, and `report` use an atomic filesystem lock at `work/execution.lock/`. A second worker or report process cannot enter while it is held. Scheduled daily reports retry every 60 seconds if a run or delivery error prevents reporting; the normal five-hour run interval and 10:00 AM Cairo report schedule remain unchanged. A duplicate daemon may remain alive but cannot overlap an operation while the shared lock is held; still configure only one production worker.
+
+All workers, containers, and OS schedules for this portal MUST share the same persistent `work/` directory, including the lock, journal, auth state, and report queue. Separate checkout-local directories or separate container volumes are not a distributed lock. Do not share one journal between different Bitrix accounts/portals. Use storage with reliable atomic directory creation and rename semantics.
+
+After an interrupted operation (including a service termination during a run) or reboot, the lock intentionally remains. It is never stolen solely because it is old, and PID checks are not trusted across container namespaces. Stop ALL workers first and inspect the lock's `owner.json`, then explicitly recover:
+
+```sh
+node src/bitrix-partner-requests.mjs unlock --confirm-workers-stopped
+```
+
+Restart one worker; its next live run reconciles unfinished journal actions before accepting anything new. Never run unlock against an active worker. While an abandoned lock remains, both runs and reports are blocked, so external service monitoring must alert on execution/lock failures. This conservative recovery avoids a paused worker resuming after another worker has stolen its lock.
+
+Validation: all `40` offline tests pass, covering durable intent before submission, acknowledgement/verification interruptions, restart recovery, uncertain-action retry prevention, journal/summary deduplication, independent recipient checkpoints, corrupt state, and lock ownership. A separate dry-run process was rejected while another local dry run held the lock. The completed headless dry run found `11` matching requests (`1` Requests and `10` New Registration), accepted `0`, and sent no emails. No new live acceptance has been performed with journaling enabled.
+
+### Deployment Steps
 
 Updating or pushing this repository does not update an already-running server or Docker container. Use the existing deployment process to pull the changes, rebuild the image if applicable, and restart the existing worker. Keep only one production worker running; do not start a separate daemon beside an existing container or service.
 
 Before resuming live processing, run the tests and a dry run in the deployed runtime:
 
 ```sh
-node --test test/bitrix-partner-requests.test.mjs
+node --test test/bitrix-partner-requests.test.mjs test/execution-state.test.mjs
 node src/bitrix-partner-requests.mjs run --dry-run --no-output-files
 ```
 
-Verify that the execution log checks both `Requests` and `New Registration`, and compare the counts with the same account and filters in Bitrix. A normal dry run accepts nothing and sends no immediate email, but it queues a developer-report record for the next daily report when recipients are configured. Preserve `.env`, `work/auth/`, and `work/daily-reports/` across deployment; do not delete pending report records or delivery state.
+Verify that the execution log checks both `Requests` and `New Registration`, and compare the counts with the same account and filters in Bitrix. A normal dry run accepts nothing and sends no immediate email, but it queues a developer-report record for the next daily report when recipients are configured. Preserve `.env` and the entire persistent `work/` directory across deployment; do not delete journal actions, locks, pending reports, or delivery state. Cleanly stop the existing worker before restarting or moving its persistent state.
 
 The production daemon still runs every five hours after each run finishes and reports daily at 10:00 AM `Africa/Cairo`. Live commands and schedules use the deployed `DRY_RUN` setting; keep it `true` during validation and restore the intended production value afterward.
 
 ## Files
 
 - `src/bitrix-partner-requests.mjs` - main automation script
+- `src/execution-state.mjs` - atomic journal persistence, shared locking, and journal report reconciliation
 - `.env.example` - environment variable template
 - `package.json` - dependencies and npm scripts
 - `work/auth/bitrix-storage-state.json` - saved browser login session, created by the login command
 - `work/daily-reports/` - small pending report records and delivery state, required even with output files disabled
+- `work/actions/` - persistent acceptance journal and per-recipient delivery checkpoints, required for every live acceptance
+- `work/execution.lock/` - shared operation lock and owner metadata; retained after a hard termination until explicit recovery
 - `work/runs/<timestamp>/summary.json` - optional structured report for each execution
 - `work/runs/<timestamp>/network.jsonl` - optional captured relevant network calls
 - `work/runs/<timestamp>/*.png` - optional before/after/error screenshots
 
-`work/auth`, `work/daily-reports`, `work/runs`, `node_modules`, and `.env` are intentionally ignored by git.
+`work/auth`, `work/daily-reports`, `work/actions`, `work/execution.lock`, `work/runs`, `node_modules`, and `.env` are intentionally ignored by git.
 
 ## Prerequisites
 

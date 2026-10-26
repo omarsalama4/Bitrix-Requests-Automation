@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "test": "node --test test/bitrix-partner-requests.test.mjs test/execution-state.test.mjs",
     "login": "node src/bitrix-partner-requests.mjs login",
     "dry-run": "node src/bitrix-partner-requests.mjs run --dry-run",
     "run": "node src/bitrix-partner-requests.mjs run",

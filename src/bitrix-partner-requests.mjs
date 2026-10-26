@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
 import { chromium } from 'playwright';
+import { AcceptanceJournal, acquireExecutionLock, unlockExecution, actionKey, journalReportRuns } from './execution-state.mjs';
 
 const ROOT = process.cwd();
 const AUTH_DIR = path.join(ROOT, 'work', 'auth');
@@ -14,6 +15,8 @@ const RUNS_DIR = path.join(ROOT, 'work', 'runs');
 const REPORT_DIR = path.join(ROOT, 'work', 'daily-reports');
 const REPORT_STATE = path.join(REPORT_DIR, 'state.json');
 const REPORT_LOCK = path.join(REPORT_DIR, 'send.lock');
+const EXECUTION_LOCK = path.join(ROOT, 'work', 'execution.lock');
+const actionJournal = new AcceptanceJournal(path.join(ROOT, 'work', 'actions'));
 const REPORT_TIME_ZONE = 'Africa/Cairo';
 const cairoFormatter = new Intl.DateTimeFormat('en-GB', {
   timeZone: REPORT_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit',
@@ -24,6 +27,8 @@ const CATEGORIES = [
   { value: 'B24', name: 'Requests' },
   { value: 'QUALIFICATION', name: 'New Registration' },
 ];
+const synchronizedFilters = new WeakMap();
+const synchronizedGrids = new WeakMap();
 
 const config = {
   bitrixUrl: process.env.BITRIX_URL || 'https://cultiv.bitrix24.com/marketplace/app/26/',
@@ -56,8 +61,14 @@ const limitArg = getArgValue(args, '--limit');
 if (limitArg !== undefined) config.limit = Number(limitArg);
 
 async function main() {
+  if (command === 'unlock') {
+    await unlockExecution(EXECUTION_LOCK, flags.has('--confirm-workers-stopped'));
+    console.log('Execution lock removed. Restart only one worker using this shared work directory.');
+    return;
+  }
   if (command === 'login') {
-    await login();
+    const release = await acquireExecutionLock(EXECUTION_LOCK, 'login');
+    try { await login(); } finally { await release(); }
     return;
   }
 
@@ -120,12 +131,18 @@ async function login() {
 }
 
 async function runOnce() {
+  const release = await acquireExecutionLock(EXECUTION_LOCK, 'run');
+  try { return await runOnceLocked(); } finally { await release(); }
+}
+
+async function runOnceLocked() {
   const startedAt = new Date();
   const runDir = config.saveOutputFiles ? path.join(RUNS_DIR, startedAt.toISOString().replace(/[:.]/g, '-')) : null;
   const networkLogPath = runDir ? path.join(runDir, 'network.jsonl') : null;
   activeRunLog = [];
 
   const summary = {
+    runId: randomUUID(),
     startedAt: startedAt.toISOString(),
     finishedAt: null,
     dryRun: config.dryRun,
@@ -141,6 +158,7 @@ async function runOnce() {
     acceptedCount: 0,
     accepted: [],
     discovered: [],
+    recovered: [],
     categories: [],
     errors: [],
     executionLog: activeRunLog,
@@ -208,6 +226,7 @@ async function runOnce() {
     await page.waitForLoadState('networkidle', { timeout: 60_000 }).catch(() => {});
     await autoLoginIfNeeded(page, context, summary.auth);
     log('Waiting for Bitrix Partner App frame...');
+    if (!config.dryRun) await reconcilePendingActions(page, summary);
     let completedCategories = 0;
     let remainingCount = 0;
     for (const category of CATEGORIES) {
@@ -217,7 +236,7 @@ async function runOnce() {
         const appFrame = await waitForPartnerFrame(page);
         await ensureCanTakePersonalFilter(appFrame, category);
         await waitForGridRefresh(appFrame);
-        const requests = (await collectRequests(appFrame)).map((request) => ({ ...request, category: category.name }));
+        const requests = (await collectAllRequests(appFrame)).map((request) => ({ ...request, category: category.name }));
         categorySummary.beforeCount = requests.length;
         summary.beforeCount += requests.length;
         summary.discovered.push(...requests);
@@ -228,7 +247,7 @@ async function runOnce() {
         }
         const refreshedFrame = await waitForPartnerFrame(page);
         await ensureCanTakePersonalFilter(refreshedFrame, category);
-        categorySummary.remainingCount = (await collectRequests(refreshedFrame)).length;
+        categorySummary.remainingCount = (await collectAllRequests(refreshedFrame)).length;
         remainingCount += categorySummary.remainingCount;
         completedCategories += 1;
       } catch (error) {
@@ -292,10 +311,11 @@ async function waitForPartnerFrame(page) {
 
 async function ensureCanTakePersonalFilter(frame, category = CATEGORIES[0]) {
   const hasFilter = await hasRequiredFilter(frame, category);
-  if (hasFilter) return;
+  const modern = await frame.locator('select[name="implementation-request-filter-APPLICATION_BUSY"]').count();
+  if (hasFilter && (!modern || synchronizedFilters.get(frame) === category.value)) return;
 
   log(`Applying filters: Category = ${category.name}; Request = Can take; Personal request = Yes.`);
-  if (await frame.locator('select[name="implementation-request-filter-APPLICATION_BUSY"]').count()) {
+  if (modern) {
     await applyModernFilters(frame, category);
     if (!(await hasRequiredFilter(frame, category))) {
       throw new Error(`Updated UI filters for ${category.name} could not be verified; no requests will be accepted.`);
@@ -335,25 +355,142 @@ async function ensureCanTakePersonalFilter(frame, category = CATEGORIES[0]) {
 }
 
 async function applyModernFilters(frame, category) {
+  synchronizedFilters.delete(frame);
   log(`Using updated Partner App filter controls for ${category.name}.`);
   const reset = frame.locator('.partner-implementation-request-list__filter-reset');
   if (await reset.isVisible()) {
-    await reset.click();
-    await waitForGridRefresh(frame);
+    await changeGridFilter(frame, () => reset.click(), {});
   }
   const categoryButton = frame.locator(`.js-outer-filter[data-indicator="${category.value}"]`);
-  await categoryButton.click();
-  await waitForGridRefresh(frame);
-  await frame.locator('select[name="implementation-request-filter-APPLICATION_BUSY"]').selectOption('FREE');
-  await waitForGridRefresh(frame);
+  await changeGridFilter(frame, () => categoryButton.click(), { PARTNERSHIP: category.value });
+  await changeGridFilter(frame, () => frame.locator('select[name="implementation-request-filter-APPLICATION_BUSY"]').selectOption('FREE'), {
+    PARTNERSHIP: category.value, APPLICATION_BUSY: 'FREE',
+  });
   const personal = frame.locator('[data-filter-code="PERSONAL"] input[type="checkbox"]');
   if (!(await personal.isChecked())) {
     await frame.locator('.partner-implementation-request-list__filter-more-button').click();
     // The native checkbox is visually replaced by a styled label in the new UI.
-    await frame.locator('[data-filter-code="PERSONAL"] label').click();
-    await waitForGridRefresh(frame);
+    await changeGridFilter(frame, () => frame.locator('[data-filter-code="PERSONAL"] label').click(), {
+      PARTNERSHIP: category.value, APPLICATION_BUSY: 'FREE', PERSONAL: 'Y',
+    });
   }
   if (!(await personal.isChecked())) throw new Error('Personal request checkbox did not become checked.');
+  synchronizedFilters.set(frame, category.value);
+}
+
+function gridResponseMatches(response, frame, expected, page = 1) {
+  try {
+    const request = response.request();
+    if (request.frame() !== frame) return false;
+    if (new URL(response.url()).searchParams.get('action') !== 'sb:service.apiPublicData.Grid.getData') return false;
+    const fields = new URLSearchParams(request.postData() || '');
+    if (Number(fields.get('gridRequest[navigation][page]') || 1) !== page) return false;
+    if ([...fields].some(([key, value]) => key.startsWith('gridRequest[filter]') && value &&
+      !/^gridRequest\[filter\]\[([^\]]+)\]$/.test(key))) return false;
+    const actual = Object.fromEntries([...fields].flatMap(([key, value]) => {
+      const match = /^gridRequest\[filter\]\[([^\]]+)\]$/.exec(key);
+      return match && value ? [[match[1], value]] : [];
+    }));
+    return Object.keys(actual).length === Object.keys(expected).length &&
+      Object.entries(expected).every(([key, value]) => actual[key] === value);
+  } catch { return false; }
+}
+
+function gridExpectation(payload, previous = null) {
+  const params = payload?.data?.additionalParams;
+  const rows = params?.gridData?.ROWS;
+  const navigation = params?.gridNavigation;
+  if (!Array.isArray(rows) || typeof navigation?.hasMore !== 'boolean') {
+    throw new Error('Bitrix grid response has no verifiable rows or pagination metadata; results are unknown.');
+  }
+  const columns = ['DATE_ACTIVE', 'CITY', 'OFFER_COUNT', 'IMPLEMENTATION', 'COUNTRY'];
+  const expectedRows = rows.map(row => {
+    if (!row?.ID || typeof row.DETAIL !== 'string') throw new Error('Bitrix grid row is missing its ID or action details.');
+    return {
+      id: String(row.ID),
+      accept: row.DETAIL.includes('js-partner-submit-application'),
+      cells: Object.fromEntries(columns.filter(column => row[column] !== undefined).map(column => [column, String(row[column] ?? '')])),
+    };
+  });
+  if (navigation.hasMore && !expectedRows.length) throw new Error('Bitrix returned an empty page with more results; scan cannot complete.');
+  const combined = [...(previous?.rows || []), ...expectedRows];
+  if (new Set(combined.map(row => row.id)).size !== combined.length) {
+    throw new Error('Bitrix pagination returned duplicate IDs; queue changed during scan. Results are unknown.');
+  }
+  return { rows: combined, hasMore: navigation.hasMore, page: (previous?.page || 0) + 1 };
+}
+
+function renderedGridMatches(expected) {
+  const wrapper = document.querySelector('.grid-1__wrapper[data-template-indicator="partner-implementation-request-list"]');
+  if (!wrapper || wrapper.classList.contains('loading')) return false;
+  const rows = [...wrapper.querySelectorAll('.grid-1__row-outer')];
+  if (rows.length !== expected.rows.length) return false;
+  const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+  const htmlText = value => {
+    const node = document.createElement('div');
+    node.innerHTML = value;
+    return normalize(node.textContent);
+  };
+  return rows.every((row, index) => {
+    const wanted = expected.rows[index];
+    const cell = id => row.querySelector(`.grid-1__cell-outer[data-id="${id}"]`);
+    return normalize(cell('ID')?.textContent) === wanted.id &&
+      Boolean(row.querySelector('.js-partner-submit-application')) === wanted.accept &&
+      Object.entries(wanted.cells).every(([id, value]) => normalize(cell(id)?.textContent) === htmlText(value));
+  });
+}
+
+async function changeGridFilter(frame, action, expected, { append = false, page: requestedPage = 1 } = {}) {
+  const page = frame.page();
+  const previous = append ? synchronizedGrids.get(frame) : null;
+  if (append && (!previous || requestedPage !== previous.page + 1)) throw new Error('Cannot paginate an unverified grid.');
+  synchronizedGrids.delete(frame);
+  const responsePromise = page.waitForResponse((response) => gridResponseMatches(response, frame, expected, requestedPage), { timeout: 60_000 });
+  // Attach the rejection handler immediately in case the UI action itself fails.
+  const observed = responsePromise.then(response => ({ response }), error => ({ error }));
+  try {
+    await action();
+    const { response, error } = await observed;
+    if (error) throw new Error('Matching Bitrix grid response timed out; results are unknown, not zero.');
+    if (!response.ok()) throw new Error(`Bitrix grid refresh failed: HTTP ${response.status()}.`);
+    const payload = await response.json().catch(() => null);
+    if (!payload || payload.status !== 'success' || (payload.errors && payload.errors.length)) {
+      throw new Error('Bitrix grid refresh returned an error or unrecognized response; results are unknown.');
+    }
+    const snapshot = gridExpectation(payload, previous);
+    await frame.waitForFunction(renderedGridMatches, snapshot, { timeout: 30_000 });
+    synchronizedGrids.set(frame, { ...snapshot, filter: { ...expected } });
+    log(`Grid response reconciled: page ${requestedPage}, ${snapshot.rows.length} rendered row(s), hasMore=${snapshot.hasMore}; ${JSON.stringify(expected)}.`);
+  } catch (error) {
+    synchronizedFilters.delete(frame);
+    throw error;
+  }
+}
+
+async function collectAllRequests(frame) {
+  let snapshot = synchronizedGrids.get(frame);
+  if (!snapshot) {
+    if (await frame.locator('select[name="implementation-request-filter-APPLICATION_BUSY"]').count()) {
+      throw new Error('Modern grid has not been reconciled with its response; count is unknown.');
+    }
+    if (await frame.locator('.main-ui-pagination-next:not(.main-ui-pagination-disabled)').count()) {
+      throw new Error('Legacy grid has additional pages; complete counting is unsupported for this layout.');
+    }
+    return collectRequests(frame);
+  }
+  for (let pageCount = 0; snapshot.hasMore; pageCount += 1) {
+    if (pageCount >= 1000) throw new Error('Pagination safety limit reached; total count is unknown.');
+    const loadMore = frame.locator('.grid-1__wrapper[data-template-indicator="partner-implementation-request-list"] [data-template-indicator="load-more"]');
+    if (!(await loadMore.isVisible())) throw new Error('Bitrix reports more pages but Load more is unavailable; total count is unknown.');
+    await changeGridFilter(frame, () => loadMore.click(), snapshot.filter, { append: true, page: snapshot.page + 1 });
+    snapshot = synchronizedGrids.get(frame);
+  }
+  await frame.waitForFunction(renderedGridMatches, snapshot, { timeout: 30_000 });
+  const requests = await collectRequests(frame);
+  const expectedIds = snapshot.rows.filter(row => row.accept).map(row => row.id).sort();
+  const actualIds = requests.map(row => row.id).sort();
+  if (JSON.stringify(expectedIds) !== JSON.stringify(actualIds)) throw new Error('Collected request IDs do not match the complete grid response; count is unknown.');
+  return requests;
 }
 
 function readModernFilterState() {
@@ -440,46 +577,101 @@ function uniqueAccepted(runs) {
   return [...requests.values()];
 }
 
-async function acceptIndividually(frame, summary, category = CATEGORIES[0]) {
+async function acceptIndividually(frame, summary, category = CATEGORIES[0], journal = actionJournal) {
+  const blocked = new Set();
   for (let round = 1; round <= 1000; round += 1) {
-    const requests = await collectRequests(frame);
+    const requests = await collectAllRequests(frame);
     if (requests.length === 0) break;
     if (limitReached(summary)) break;
 
+    let attempted = false;
     for (const request of requests) {
       if (limitReached(summary)) break;
       if (!request.id || !request.acceptUrl) throw new Error('Request is missing its ID or acceptance URL.');
+      const key = actionKey({ ...request, category: category.name });
+      if (blocked.has(key)) continue;
+      if (await journal.get(key)) {
+        blocked.add(key);
+        summary.errors.push({ message: `Action ${key} is already journaled; skipping automatic retry pending reconciliation.` });
+        continue;
+      }
       if (summary.accepted.some((item) => item.id === request.id && item.category === category.name)) {
         throw new Error(`Previously accepted request ${request.id} is still available; stopping to avoid duplicate actions.`);
       }
       log(`Accepting request ${request.id || '(no id)'}...`);
-      const acceptResponsePromise = frame.page().waitForResponse((response) =>
-        response.url().includes('PARTNER_TAKE_APPLICATION') &&
-        new URL(response.url()).searchParams.get('applicationId') === request.id,
-      { timeout: 30_000 }).catch(() => null);
-      await frame.evaluate((url) => {
-        window.b24ApplicationList.getApplication({ url });
-      }, request.acceptUrl);
-      const acceptResponse = await acceptResponsePromise;
-      if (!acceptResponse) throw new Error(`Acceptance of request ${request.id} is unconfirmed: response timed out. Not counted.`);
-      const payload = await acceptResponse.json().catch(() => null);
-      verifyAcceptResponse(acceptResponse.status(), payload);
-      const page = frame.page();
-      await page.reload({ waitUntil: 'domcontentloaded' });
-      frame = await waitForPartnerFrame(page);
-      await ensureCanTakePersonalFilter(frame, category);
-      await waitForGridRefresh(frame);
-      if ((await collectRequests(frame)).some((item) => item.id === request.id)) {
-        throw new Error(`Request ${request.id} remains available after acceptance; not counted.`);
+      await journal.begin({ ...request, category: category.name }, summary.runId);
+      attempted = true;
+      try {
+        const acceptResponsePromise = frame.page().waitForResponse((response) =>
+          response.url().includes('PARTNER_TAKE_APPLICATION') &&
+          new URL(response.url()).searchParams.get('applicationId') === request.id,
+        { timeout: 30_000 }).catch(() => null);
+        await frame.evaluate((url) => {
+          window.b24ApplicationList.getApplication({ url });
+        }, request.acceptUrl);
+        const acceptResponse = await acceptResponsePromise;
+        if (!acceptResponse) throw new Error(`Acceptance of request ${request.id} is unconfirmed: response timed out. Not counted.`);
+        const payload = await acceptResponse.json().catch(() => null);
+        verifyAcceptResponse(acceptResponse.status(), payload);
+        await journal.mark(key, 'acknowledged');
+        const page = frame.page();
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        frame = await waitForPartnerFrame(page);
+        await ensureCanTakePersonalFilter(frame, category);
+        await waitForGridRefresh(frame);
+        if ((await collectAllRequests(frame)).some((item) => item.id === request.id)) {
+          throw new Error(`Request ${request.id} remains available after acceptance; not counted.`);
+        }
+        const verified = await journal.confirm(key, 'acknowledged-and-absent');
+        summary.accepted.push(verified.request);
+        summary.acceptedCount = summary.accepted.length;
+        log(`Verified acceptance of request ${request.id} (${category.name}).`);
+      } catch (error) {
+        await journal.mark(key, 'unconfirmed');
+        throw error;
       }
-      summary.accepted.push({ ...request, category: category.name, acceptedAt: new Date().toISOString(), verified: true });
-      summary.acceptedCount = summary.accepted.length;
-      log(`Verified acceptance of request ${request.id} (${category.name}).`);
       break;
     }
+    if (!attempted) break;
   }
-  if (!limitReached(summary) && (await collectRequests(frame)).length) {
+  if (!blocked.size && !limitReached(summary) && (await collectAllRequests(frame)).length) {
     throw new Error(`${category.name}: safety round limit reached with requests still available.`);
+  }
+}
+
+async function findOwnAcceptedRequest(frame, record) {
+  const category = CATEGORIES.find(item => item.name === record.request.category);
+  if (!category) throw new Error('Journal category is unsupported.');
+  await changeGridFilter(frame, () => frame.locator('.partner-implementation-request-list__filter-reset').click(), {});
+  await changeGridFilter(frame, () => frame.locator(`.js-outer-filter[data-indicator="${category.value}"]`).click(), { PARTNERSHIP: category.value });
+  await frame.locator('.partner-implementation-request-list__filter-more-button').click();
+  await changeGridFilter(frame, () => frame.locator('[data-filter-code="PERSONAL"] label').click(), { PARTNERSHIP: category.value, PERSONAL: 'Y' });
+  await changeGridFilter(frame, () => frame.locator('select[name="implementation-request-filter-MY_OFFERS"]').selectOption('ALL'), { PARTNERSHIP: category.value, PERSONAL: 'Y', MY_OFFERS: 'ALL' });
+  const filter = { PARTNERSHIP: category.value, PERSONAL: 'Y', MY_OFFERS: 'ALL', APPLICATION_ID: record.request.id };
+  await changeGridFilter(frame, () => frame.locator('[data-filter-code="APPLICATION_ID"] input').fill(record.request.id), filter);
+  await collectAllRequests(frame);
+  return frame.evaluate(ownAssignmentEvidence, record.request.id);
+}
+
+function ownAssignmentEvidence(id) {
+  const row = [...document.querySelectorAll('.grid-1__row-outer')].find(node => node.querySelector('[data-id="ID"]')?.textContent.trim() === id);
+  return Boolean(row && !row.querySelector('.js-partner-submit-application') &&
+    row.querySelector('.js-partner-synchronize-deal, .js-partner-recovery-deal, .partner-application-b24-list-detail-deal-link'));
+}
+
+async function reconcilePendingActions(page, summary, journal = actionJournal, lookup = findOwnAcceptedRequest) {
+  for (const record of await journal.records()) {
+    if (record.status === 'verified') continue;
+    try {
+      const frame = await waitForPartnerFrame(page);
+      synchronizedFilters.delete(frame);
+      if (!(await lookup(frame, record))) throw new Error('Own assignment could not be established from accepted-request evidence.');
+      const verified = await journal.confirm(record.key, 'own-accepted-list');
+      summary.recovered.push(verified.request);
+      log(`Recovered verified acceptance ${record.key} from own accepted requests.`);
+    } catch (error) {
+      summary.errors.push({ message: `Unconfirmed action ${record.key}: ${error.message} Automatic retry is blocked.` });
+    }
   }
 }
 
@@ -723,22 +915,22 @@ function scheduleDailyReport() {
   const today = cairoDateKey(now);
   const nextDate = now < cairoTenUtc(today) ? today : adjacentDateKey(today, 1);
   const delay = Math.max(1000, cairoTenUtc(nextDate).getTime() - now.getTime());
-  setTimeout(async () => {
-    try {
-      await sendDailyReports();
-    } catch (error) {
-      console.error(`Daily report failed: ${error.message}`);
-    } finally {
-      scheduleDailyReport();
-    }
-  }, delay);
+  setTimeout(sendScheduledReport, delay);
+}
+
+async function sendScheduledReport() {
+  try { await sendDailyReports(); scheduleDailyReport(); }
+  catch (error) {
+    console.error(`Daily report deferred; retrying in 60 seconds: ${error.message}`);
+    setTimeout(sendScheduledReport, 60_000);
+  }
 }
 
 async function sendDailyReportsIfDue() {
   const now = new Date();
   if (now < cairoTenUtc(cairoDateKey(now))) return;
   if (!(await fileExists(REPORT_STATE)) && !(await fs.readdir(REPORT_DIR).catch(() => []))
-    .some((name) => name.endsWith('.json'))) return;
+    .some((name) => name.endsWith('.json')) && !(await actionJournal.records()).length) return;
   const { cutoff } = latestReportCutoff();
   const state = await readReportState();
   if (state.businessThrough !== cutoff || state.developerThrough !== cutoff) {
@@ -769,6 +961,11 @@ async function readQueuedReports() {
 }
 
 async function sendDailyReports() {
+  const release = await acquireExecutionLock(EXECUTION_LOCK, 'report');
+  try { return await sendDailyReportsLocked(); } finally { await release(); }
+}
+
+async function sendDailyReportsLocked() {
   const now = new Date();
   if (now < cairoTenUtc(cairoDateKey(now))) {
     console.log('Daily reports are due at 10:00 AM Cairo time.');
@@ -793,6 +990,7 @@ async function sendDailyReports() {
     const { dateKey, cutoff } = latestReportCutoff();
     const state = await readReportState();
     const entries = await readQueuedReports();
+    const actions = await actionJournal.records();
     const previousCutoff = cairoTenUtc(adjacentDateKey(dateKey, -1)).toISOString();
     const periodStart = (through) => formatCairoDateTime(through ||
       (entries[0]?.queuedAt < previousCutoff ? entries[0].queuedAt : previousCutoff));
@@ -800,8 +998,9 @@ async function sendDailyReports() {
     let failed = false;
 
     if (!state.businessThrough || state.businessThrough < cutoff) {
-      const runs = entries.filter((entry) => entry.queuedAt > (state.businessThrough || '') && entry.queuedAt <= cutoff)
+      const queuedRuns = entries.filter((entry) => entry.queuedAt > (state.businessThrough || '') && entry.queuedAt <= cutoff)
         .map((entry) => entry.summary);
+      const { runs, keys } = journalReportRuns(queuedRuns, actions, 'business', cutoff);
       const accepted = uniqueAccepted(runs);
       const latestWithRemaining = [...runs].reverse().find((run) => run.remainingCount !== undefined);
       try {
@@ -809,6 +1008,7 @@ async function sendDailyReports() {
           reportDate: dateKey, periodStart: periodStart(state.businessThrough), periodEnd,
           accepted, acceptedCount: accepted.length, remainingCount: latestWithRemaining?.remainingCount,
         });
+        for (const key of keys) await actionJournal.delivered(key, 'business');
         state.businessThrough = cutoff;
         await saveReportState(state);
         console.log(`Business daily report handled for ${dateKey}: ${accepted.length} accepted.`);
@@ -819,12 +1019,14 @@ async function sendDailyReports() {
     }
 
     if (!state.developerThrough || state.developerThrough < cutoff) {
-      const runs = entries.filter((entry) => entry.queuedAt > (state.developerThrough || '') && entry.queuedAt <= cutoff)
+      const queuedRuns = entries.filter((entry) => entry.queuedAt > (state.developerThrough || '') && entry.queuedAt <= cutoff)
         .map((entry) => entry.summary);
+      const { runs, keys } = journalReportRuns(queuedRuns, actions, 'developer', cutoff);
       try {
         await sendDeveloperReport({
           reportDate: dateKey, periodStart: periodStart(state.developerThrough), periodEnd, runs,
         });
+        for (const key of keys) await actionJournal.delivered(key, 'developer');
         state.developerThrough = cutoff;
         await saveReportState(state);
         console.log(`Developer daily report handled for ${dateKey}: ${runs.length} runs.`);
@@ -1203,7 +1405,7 @@ async function waitForEnter() {
   });
 }
 
-export { CATEGORIES, hasRequiredFilter, ensureCanTakePersonalFilter, applyModernFilters, readModernFilterState, collectRequests, acceptIndividually, verifyAcceptResponse, uniqueAccepted, reportRequest, buildBusinessReportText, buildDailyDeveloperText, buildDailyDeveloperHtml, autoLoginIfNeeded };
+export { CATEGORIES, hasRequiredFilter, ensureCanTakePersonalFilter, applyModernFilters, readModernFilterState, collectRequests, collectAllRequests, acceptIndividually, verifyAcceptResponse, uniqueAccepted, reportRequest, buildBusinessReportText, buildDailyDeveloperText, buildDailyDeveloperHtml, autoLoginIfNeeded, gridResponseMatches, changeGridFilter, gridExpectation, renderedGridMatches, reconcilePendingActions, findOwnAcceptedRequest, ownAssignmentEvidence };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch((error) => {
   console.error(error);
