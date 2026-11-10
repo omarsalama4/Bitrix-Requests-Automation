@@ -11,6 +11,7 @@ import {
   collectRequests, readModernFilterState, applyModernFilters,
   gridResponseMatches, changeGridFilter,
   gridExpectation, renderedGridMatches, collectAllRequests,
+  GridRefreshError, discoverWithGridRecovery,
 } from '../src/bitrix-partner-requests.mjs';
 
 async function acceptIndividually(frame, summary, category) {
@@ -189,6 +190,39 @@ test('grid response must match the frame, category and complete filter set', () 
   assert.equal(gridResponseMatches(gridResponse(frame, { ...expected, COUNTRY: 'EG' }), frame, expected), false);
   assert.equal(gridResponseMatches(gridResponse(frame, { ...expected, 'COUNTRY][0': 'EG' }), frame, expected), false);
   assert.equal(gridResponseMatches(gridResponse(frame, expected, { page: 2 }), frame, expected, 1), false);
+});
+
+test('discovery retries a grid response failure only once after reopening', async () => {
+  const steps = [];
+  const result = await discoverWithGridRecovery(async () => {
+    steps.push('scan');
+    if (steps.length === 1) throw new GridRefreshError('invalid grid response');
+    return ['3561275', '3560123'];
+  }, async () => { steps.push('reopen'); });
+  assert.deepEqual(result, ['3561275', '3560123']);
+  assert.deepEqual(steps, ['scan', 'reopen', 'scan']);
+
+  let reopenCount = 0;
+  await assert.rejects(discoverWithGridRecovery(async () => {
+    throw new GridRefreshError('still unavailable');
+  }, async () => { reopenCount++; }), /still unavailable/);
+  assert.equal(reopenCount, 1);
+  await assert.rejects(discoverWithGridRecovery(async () => {
+    throw new Error('filter could not be verified');
+  }, async () => { reopenCount++; }), /filter could not be verified/);
+  assert.equal(reopenCount, 1);
+});
+
+test('rejected grid response logs filter context and codes without raw server text', async () => {
+  const frame = { page: () => ({ waitForResponse: async () => gridResponse(frame, {}, {
+    payload: { status: 'error', errors: [{ code: 'SESSION_ERROR', message: 'private server details' }] },
+  }) }) };
+  await assert.rejects(changeGridFilter(frame, async () => {}, {}), error => {
+    assert.ok(error instanceof GridRefreshError);
+    assert.match(error.message, /page 1.*HTTP 200.*SESSION_ERROR.*unknown/);
+    assert.doesNotMatch(error.message, /private server details/);
+    return true;
+  });
 });
 
 test('slow grid response and rendering are awaited before reading any results', async () => {

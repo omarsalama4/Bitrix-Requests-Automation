@@ -80,6 +80,10 @@ Local headless dry-run validation found `1` matching request in `Requests` (incl
 
 ### Complete Queue Counts and Pagination
 
+**Connection and discovery validation (2026-11-10):** The initial local run refreshed an expired login and opened the Partner App, but the grid response was rejected. After refreshing the session, live inspection showed that the existing filter controls and grid response format still work. The script now locates the app by its DOM without requiring an iframe class and reopens the app to retry initial discovery once after a grid HTTP, response, or timeout error. Persistent failures remain errors, not successful empty scans. Diagnostic messages include the page, filter fields, HTTP status, and available error codes rather than raw response bodies. Acceptance is not retried by this recovery path.
+
+A subsequent headless dry run verified both categories with `Can take` and `Personal request` enabled: `2` eligible Requests, `0` New Registration, and no additional pages in either response. Nothing was accepted or emailed. The live run did not need the retry; offline tests cover recovery and retry exhaustion.
+
 Discovery now follows the response's `gridNavigation.hasMore` flag and clicks the grid's `Load more` control until the server reports no more pages. Every appended page must have the expected filters and consecutive page number, and the cumulative rendered rows must match all response rows. Only after the full scan are eligible request IDs reconciled and counted. This applies to dry runs, initial discovery, post-acceptance verification, and remaining counts after a limited live run. `--limit` restricts acceptance, not discovery or reporting of the remaining queue.
 
 Missing pagination controls, duplicate IDs across pages (for example, a shifting queue), response/DOM differences, or the pagination safety limit produce an error instead of a partial total. Counts describe the completed scan, not an atomic snapshot against simultaneous changes by other users. On the legacy table layout, an additional-page control produces an explicit unsupported-pagination error rather than reporting a first-page count as complete.

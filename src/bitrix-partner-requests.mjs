@@ -233,10 +233,16 @@ async function runOnceLocked() {
       const categorySummary = { category: category.name, beforeCount: 0, acceptedCount: 0 };
       summary.categories.push(categorySummary);
       try {
-        const appFrame = await waitForPartnerFrame(page);
-        await ensureCanTakePersonalFilter(appFrame, category);
-        await waitForGridRefresh(appFrame);
-        const requests = (await collectAllRequests(appFrame)).map((request) => ({ ...request, category: category.name }));
+        const { frame: appFrame, requests } = await discoverWithGridRecovery(async () => {
+          const frame = await waitForPartnerFrame(page);
+          await ensureCanTakePersonalFilter(frame, category);
+          if (!synchronizedGrids.has(frame)) await waitForGridRefresh(frame);
+          const requests = (await collectAllRequests(frame)).map(request => ({ ...request, category: category.name }));
+          return { frame, requests };
+        }, async () => {
+          await page.goto(config.bitrixUrl, { waitUntil: 'domcontentloaded', timeout: 90_000 });
+          await autoLoginIfNeeded(page, context, summary.auth);
+        });
         categorySummary.beforeCount = requests.length;
         summary.beforeCount += requests.length;
         summary.discovered.push(...requests);
@@ -278,8 +284,20 @@ async function runOnceLocked() {
   }
 }
 
+class GridRefreshError extends Error {}
+
+async function discoverWithGridRecovery(discover, reopen) {
+  try { return await discover(); }
+  catch (error) {
+    if (!(error instanceof GridRefreshError)) throw error;
+    log(`Discovery grid refresh failed: ${error.message} Reopening Partner App and retrying discovery once.`);
+    await reopen();
+    return discover();
+  }
+}
+
 async function waitForPartnerFrame(page) {
-  await page.waitForSelector('iframe.app-frame', { timeout: 90_000 }).catch(() => {});
+  const diagnosticUrl = (frame) => frame.url().split(/[?#]/, 1)[0];
   for (let attempt = 0; attempt < 90; attempt += 1) {
     for (const frame of page.frames()) {
       const hasPartnerBlock = await frame.locator([
@@ -292,18 +310,18 @@ async function waitForPartnerFrame(page) {
         '.js-action-button[data-name="automatic_action"]',
       ].join(', ')).count().catch(() => 0);
       if (hasPartnerBlock > 0) {
-        log(`Partner App frame found by app DOM: ${frame.url() || '(frame URL unavailable)'}`);
+        log(`Partner App frame found by app DOM: ${diagnosticUrl(frame) || '(frame URL unavailable)'}`);
         return frame;
       }
     }
     if (attempt > 0 && attempt % 15 === 0) {
-      log(`Still waiting for app DOM. Frames: ${page.frames().map((frame) => frame.url() || '(empty)').join(' | ')}`);
+      log(`Still waiting for app DOM. Frames: ${page.frames().map((frame) => diagnosticUrl(frame) || '(empty)').join(' | ')}`);
     }
     await page.waitForTimeout(1000);
   }
 
   const diagnostics = await Promise.all(page.frames().map(async (frame) => ({
-    url: frame.url(),
+    url: diagnosticUrl(frame),
     title: await frame.title().catch(() => ''),
   })));
   throw new Error(`Partner app iframe did not load. Frames seen: ${JSON.stringify(diagnostics)}`);
@@ -451,11 +469,15 @@ async function changeGridFilter(frame, action, expected, { append = false, page:
   try {
     await action();
     const { response, error } = await observed;
-    if (error) throw new Error('Matching Bitrix grid response timed out; results are unknown, not zero.');
-    if (!response.ok()) throw new Error(`Bitrix grid refresh failed: HTTP ${response.status()}.`);
+    const step = `page ${requestedPage}, ${JSON.stringify(expected)}`;
+    if (error) throw new GridRefreshError(`Matching Bitrix grid response timed out (${step}); results are unknown, not zero.`);
+    if (!response.ok()) throw new GridRefreshError(`Bitrix grid refresh failed: HTTP ${response.status()} (${step}); results are unknown.`);
     const payload = await response.json().catch(() => null);
     if (!payload || payload.status !== 'success' || (payload.errors && payload.errors.length)) {
-      throw new Error('Bitrix grid refresh returned an error or unrecognized response; results are unknown.');
+      const token = (value) => typeof value === 'string' && /^[a-z0-9_.:-]{1,60}$/i.test(value) ? value : 'unknown';
+      const codes = Array.isArray(payload?.errors) ? payload.errors.slice(0, 4).map(item => token(item?.code)) : [];
+      const diagnostic = !payload ? 'non-JSON or unreadable body' : `status=${token(payload.status)}${codes.length ? `, error codes=${codes.join(',')}` : ''}`;
+      throw new GridRefreshError(`Bitrix grid response was rejected (${step}; HTTP ${response.status()}, ${diagnostic}); results are unknown.`);
     }
     const snapshot = gridExpectation(payload, previous);
     await frame.waitForFunction(renderedGridMatches, snapshot, { timeout: 30_000 });
@@ -1405,7 +1427,7 @@ async function waitForEnter() {
   });
 }
 
-export { CATEGORIES, hasRequiredFilter, ensureCanTakePersonalFilter, applyModernFilters, readModernFilterState, collectRequests, collectAllRequests, acceptIndividually, verifyAcceptResponse, uniqueAccepted, reportRequest, buildBusinessReportText, buildDailyDeveloperText, buildDailyDeveloperHtml, autoLoginIfNeeded, gridResponseMatches, changeGridFilter, gridExpectation, renderedGridMatches, reconcilePendingActions, findOwnAcceptedRequest, ownAssignmentEvidence };
+export { CATEGORIES, hasRequiredFilter, ensureCanTakePersonalFilter, applyModernFilters, readModernFilterState, collectRequests, collectAllRequests, acceptIndividually, verifyAcceptResponse, uniqueAccepted, reportRequest, buildBusinessReportText, buildDailyDeveloperText, buildDailyDeveloperHtml, autoLoginIfNeeded, gridResponseMatches, changeGridFilter, gridExpectation, renderedGridMatches, reconcilePendingActions, findOwnAcceptedRequest, ownAssignmentEvidence, GridRefreshError, discoverWithGridRecovery };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch((error) => {
   console.error(error);
